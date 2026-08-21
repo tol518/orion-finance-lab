@@ -19,7 +19,7 @@
     "check": "npm run verify:public && npm test && npm run build"
   },
   "dependencies": {
-    "dotenv": "^16.4.7",
+    "dotenv": "^17.4.2",
     "express": "^4.21.2",
     "yahoo-finance2": "^4.0.2"
   },
