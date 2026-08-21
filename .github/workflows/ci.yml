@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            ui/package-lock.json
+            openclaw-plugin/package-lock.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install service dependencies
+        run: npm ci
+      - name: Install Finance Room dependencies
+        run: npm --prefix ui ci
+      - name: Install OpenClaw plugin dependencies
+        run: npm --prefix openclaw-plugin ci --legacy-peer-deps
+      - name: Verify public release contents
+        run: npm run verify:public
+      - name: Run tests
+        run: npm test
+      - name: Build Finance Room
+        run: npm run build
+      - name: Compile-check Python bridges
+        run: python -m py_compile integrations/ibkr_gateway_bridge.py integrations/tradingagents_runner.py

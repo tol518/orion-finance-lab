@@ -1,0 +1,151 @@
+{
+  "id": "orion-finance-lab",
+  "name": "Orion Finance Lab",
+  "description": "Composable market research, prediction, risk, and paper-trading tools backed by Orion Finance Lab.",
+  "activation": {
+    "onStartup": true
+  },
+  "contracts": {
+    "tools": [
+      "finance_get_quote",
+      "finance_get_price_history",
+      "finance_get_fundamentals",
+      "finance_get_news",
+      "finance_get_market_context",
+      "finance_run_quant_analysis",
+      "finance_run_strategy",
+      "finance_get_portfolio",
+      "finance_get_trade_history",
+      "finance_create_trade_proposal",
+      "finance_execute_paper_trade",
+      "finance_record_prediction",
+      "finance_get_prediction_results",
+      "finance_get_agent_performance",
+      "finance_compare_strategies",
+      "finance_get_risk_state",
+      "finance_create_experiment"
+    ]
+  },
+  "toolMetadata": {
+    "finance_get_quote": { "optional": true },
+    "finance_get_price_history": { "optional": true },
+    "finance_get_fundamentals": { "optional": true },
+    "finance_get_news": { "optional": true },
+    "finance_get_market_context": { "optional": true },
+    "finance_run_quant_analysis": { "optional": true },
+    "finance_run_strategy": { "optional": true },
+    "finance_get_portfolio": { "optional": true },
+    "finance_get_trade_history": { "optional": true },
+    "finance_create_trade_proposal": { "optional": true },
+    "finance_execute_paper_trade": { "optional": true },
+    "finance_record_prediction": { "optional": true },
+    "finance_get_prediction_results": { "optional": true },
+    "finance_get_agent_performance": { "optional": true },
+    "finance_compare_strategies": { "optional": true },
+    "finance_get_risk_state": { "optional": true },
+    "finance_create_experiment": { "optional": true }
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "serviceUrl": {
+        "type": "string",
+        "format": "uri",
+        "default": "http://127.0.0.1:4830/api"
+      },
+      "serviceToken": {
+        "type": "string",
+        "minLength": 64,
+        "pattern": "^[A-Fa-f0-9]{64,}$"
+      },
+      "agentSigningKey": {
+        "type": "string",
+        "minLength": 64,
+        "pattern": "^[A-Fa-f0-9]{64,}$"
+      },
+      "requestTimeoutMs": {
+        "type": "integer",
+        "minimum": 1000,
+        "maximum": 600000,
+        "default": 30000
+      },
+      "defaultPermissions": {
+        "type": "array",
+        "uniqueItems": true,
+        "items": {
+          "type": "string",
+          "enum": [
+            "market.read",
+            "portfolio.read",
+            "strategy.run",
+            "prediction.write",
+            "trade.propose",
+            "trade.execute",
+            "experiment.manage",
+            "audit.read"
+          ]
+        },
+        "default": ["market.read", "portfolio.read", "strategy.run", "prediction.write", "trade.propose"]
+      },
+      "agentPermissions": {
+        "type": "object",
+        "additionalProperties": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "enum": [
+              "market.read",
+              "portfolio.read",
+              "strategy.run",
+              "prediction.write",
+              "trade.propose",
+              "trade.execute",
+              "experiment.manage",
+              "audit.read"
+            ]
+          }
+        },
+        "default": {}
+      }
+    }
+  },
+  "configContracts": {
+    "secretInputs": {
+      "paths": [
+        { "path": "serviceToken", "expected": "string" },
+        { "path": "agentSigningKey", "expected": "string" }
+      ]
+    }
+  },
+  "uiHints": {
+    "serviceUrl": {
+      "label": "Finance Lab Service URL",
+      "help": "Loopback URL for the standalone Finance Lab paper-trading service."
+    },
+    "serviceToken": {
+      "label": "Finance Lab Service Token",
+      "help": "Bearer token shared with the Finance Lab service.",
+      "sensitive": true
+    },
+    "agentSigningKey": {
+      "label": "Finance Agent Signing Key",
+      "help": "Separate secret used to authenticate agent identity and permission assertions.",
+      "sensitive": true
+    },
+    "defaultPermissions": {
+      "label": "Default Agent Permissions",
+      "help": "Finance capabilities granted when an agent has no explicit entry. trade.execute is deliberately excluded by default."
+    },
+    "agentPermissions": {
+      "label": "Per-Agent Permissions",
+      "help": "Permission arrays keyed by Orion/OpenClaw immutable agent ID."
+    },
+    "requestTimeoutMs": {
+      "label": "Request Timeout",
+      "help": "Maximum Finance Lab request time in milliseconds.",
+      "advanced": true
+    }
+  }
+}

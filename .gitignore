@@ -1,0 +1,25 @@
+node_modules/
+ui/node_modules/
+openclaw-plugin/node_modules/
+ui/dist/
+data/
+.env
+.env.*
+!.env.example
+.venv*/
+__pycache__/
+*.py[cod]
+*.log
+*.sqlite
+*.sqlite-*
+*.db
+coverage/
+*.pem
+*.key
+*.p12
+*.pfx
+twsapi*/
+TWS API*/
+*.zip
+*.tar.gz
+.DS_Store
