@@ -26,7 +26,7 @@ jobs:
             package-lock.json
             ui/package-lock.json
             openclaw-plugin/package-lock.json
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.13"
       - name: Install service dependencies
