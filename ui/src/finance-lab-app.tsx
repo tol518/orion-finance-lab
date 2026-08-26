@@ -9,6 +9,7 @@ import {
   CheckCircle2,
   ChevronRight,
   CircleDollarSign,
+  Crown,
   FlaskConical,
   Gauge,
   History,
@@ -26,15 +27,23 @@ import {
 } from "lucide-react";
 import type {
   AgentPerformance,
+  BrokerOrder,
   Experiment,
   FinanceAgent,
   FinanceTeam,
+  FinanceTeamMember,
+  LiveOrderResult,
+  OrderPreview,
+  ReconcileReport,
   Overview,
   Portfolio,
   Prediction,
   Proposal,
   Strategy,
   StrategyRun,
+  TeamPortfolio,
+  TeamPortfolios,
+  TeamPortfolioTotal,
   Trade,
 } from "./types";
 
@@ -86,7 +95,7 @@ export default function FinanceLabApp({ apiBase }: { apiBase: string }) {
           <div className="eyebrow">ORION / FINANCE LAB</div>
           <div className="title-row">
             <h1>Finance Lab</h1>
-            <span className="paper-badge"><ShieldCheck size={13} /> {overview.mode === "ibkr-paper-read-only" ? "IBKR PAPER / READ ONLY" : "LOCAL PAPER"}</span>
+            <span className="paper-badge"><ShieldCheck size={13} /> {MODE_LABEL[overview.mode]}</span>
           </div>
           <p>Auditable research, deterministic risk, and measurable agent track records.</p>
         </div>
@@ -102,8 +111,8 @@ export default function FinanceLabApp({ apiBase }: { apiBase: string }) {
       </nav>
 
       {tab === "Overview" && <OverviewView overview={overview} request={request} refresh={refresh} onResearch={setResearchResult} onNavigate={setTab} />}
-      {tab === "Portfolio" && <PortfolioView portfolio={overview.portfolio} />}
-      {tab === "Trades" && <TradesView trades={overview.recentTrades} proposals={overview.recentProposals} currency={overview.portfolio.currency} request={request} refresh={refresh} />}
+      {tab === "Portfolio" && <PortfolioView portfolio={overview.portfolio} teamPortfolios={overview.teamPortfolios} brokerOrders={overview.recentBrokerOrders} mode={overview.mode} />}
+      {tab === "Trades" && <TradesView trades={overview.recentTrades} proposals={overview.recentProposals} brokerOrders={overview.recentBrokerOrders} financeTeams={overview.financeTeams} teamPortfolios={overview.teamPortfolios} defaultCurrency={overview.portfolio.currency} mode={overview.mode} request={request} refresh={refresh} />}
       {tab === "Predictions" && <PredictionsView predictions={overview.recentPredictions} request={request} refresh={refresh} />}
       {tab === "Agents" && <AgentsView agents={overview.agents} financeAgents={overview.financeAgents} financeTeams={overview.financeTeams} request={request} refresh={refresh} />}
       {tab === "Strategies" && <StrategiesView strategies={overview.strategies} request={request} onResearch={setResearchResult} />}
@@ -182,7 +191,7 @@ function Allocation({ portfolio }: { portfolio: Portfolio }) {
 }
 
 function PositionTable({ positions, currency, compact = false }: { positions: Portfolio["positions"]; currency: string; compact?: boolean }) {
-  if (!positions.length) return <Empty text="No open positions. Approved paper trades will appear here." />;
+  if (!positions.length) return <Empty text="No filled positions. Working IBKR orders remain separate until the broker reports a fill." />;
   return <div className="table-wrap"><table><thead><tr><th>Security</th><th>Qty</th><th>Price</th><th>Market value</th><th>Unrealised P&amp;L</th>{!compact && <th>Daily P&amp;L</th>}</tr></thead><tbody>{positions.map((position) => <tr key={position.symbol}><td><strong>{position.symbol}</strong>{position.quoteError && <small>stale quote</small>}</td><td>{number(position.quantity)}</td><td>{money(position.price, currency)}</td><td>{money(position.marketValue, currency)}</td><td className={tone(position.unrealisedPnl)}>{signedMoney(position.unrealisedPnl, currency)}</td>{!compact && <td className={tone(position.dailyPnl)}>{signedMoney(position.dailyPnl, currency)}</td>}</tr>)}</tbody></table></div>;
 }
 
@@ -215,15 +224,124 @@ function RiskBar({ label, value, limit }: { label: string; value: number | null;
   return <div><div><span>{label}</span><small>{optionalPercent(value)} / {percent(limit)}</small></div><div className="bar"><i style={{ width: `${width}%` }} /></div></div>;
 }
 
-function PortfolioView({ portfolio }: { portfolio: Portfolio }) {
-  return <div className="view-stack"><div className="section-heading"><div><span className="eyebrow">PAPER PORTFOLIO</span><h2>{portfolio.name}</h2></div><span className="mode-label"><ShieldCheck size={14} /> No live execution</span></div><div className="metric-strip four"><Metric label="Total value" value={money(portfolio.totalValue, portfolio.currency)} detail={portfolio.currency} /><Metric label="Cash reserve" value={money(portfolio.cash, portfolio.currency)} detail={percent(portfolio.cash / portfolio.totalValue)} /><Metric label="Gross exposure" value={money(portfolio.grossExposure, portfolio.currency)} detail={percent(portfolio.grossExposure / portfolio.totalValue)} /><Metric label="Max drawdown" value={optionalPercent(portfolio.drawdown)} detail={`${portfolio.performance.observations} valuation points`} tone={tone(portfolio.drawdown ?? 0)} /></div><Panel title="Current positions" icon={<WalletCards size={16} />}><PositionTable positions={portfolio.positions} currency={portfolio.currency} /></Panel><div className="analytics-grid"><Analytic label="Annualized return" value={optionalPercent(portfolio.performance.annualizedReturn)} /><Analytic label="Volatility" value={optionalPercent(portfolio.performance.volatility)} /><Analytic label="Sharpe ratio" value={optionalNumber(portfolio.performance.sharpe)} /><Analytic label="Sortino ratio" value={optionalNumber(portfolio.performance.sortino)} /></div></div>;
+function PortfolioView({ portfolio, teamPortfolios, brokerOrders, mode }: { portfolio: Portfolio; teamPortfolios: TeamPortfolios; brokerOrders: BrokerOrder[]; mode: Overview["mode"] }) {
+  const teams = teamPortfolios.teams;
+  return <div className="view-stack">
+    <div className="section-heading"><div><span className="eyebrow">PAPER PORTFOLIO</span><h2>{portfolio.name}</h2></div><span className="mode-label"><ShieldCheck size={14} /> {MODE_LABEL[mode]}</span></div>
+    <div className="metric-strip four"><Metric label="Total value" value={money(portfolio.totalValue, portfolio.currency)} detail={portfolio.currency} /><Metric label="Cash reserve" value={money(portfolio.cash, portfolio.currency)} detail={percent(portfolio.cash / portfolio.totalValue)} /><Metric label="Gross exposure" value={money(portfolio.grossExposure, portfolio.currency)} detail={percent(portfolio.grossExposure / portfolio.totalValue)} /><Metric label="Max drawdown" value={optionalPercent(portfolio.drawdown)} detail={`${portfolio.performance.observations} valuation points`} tone={tone(portfolio.drawdown ?? 0)} /></div>
+    <Panel title="Current positions" icon={<WalletCards size={16} />}><PositionTable positions={portfolio.positions} currency={portfolio.currency} /></Panel>
+    <div className="analytics-grid"><Analytic label="Annualized return" value={optionalPercent(portfolio.performance.annualizedReturn)} /><Analytic label="Volatility" value={optionalPercent(portfolio.performance.volatility)} /><Analytic label="Sharpe ratio" value={optionalNumber(portfolio.performance.sharpe)} /><Analytic label="Sortino ratio" value={optionalNumber(portfolio.performance.sortino)} /></div>
+
+    <div className="section-heading"><div><span className="eyebrow">TEAM PORTFOLIOS</span><h2>{teams.length} of 5 team portfolios</h2><p>Every finance team runs its own paper portfolio. Creating a team opens one, and the combined section below rolls all of them up.</p></div></div>
+    {teams.length
+      ? <>{teams.map((entry) => <TeamPortfolioPanel key={entry.teamId} entry={entry} brokerOrders={brokerOrders.filter((order) => order.portfolioId === entry.portfolio.id && order.status === "WORKING")} />)}<TeamPortfolioTotalPanel total={teamPortfolios.total} /></>
+      : <Empty text="No finance teams yet. Create a team in the Agents tab and its paper portfolio appears here." />}
+  </div>;
 }
 
-function TradesView({ trades, proposals, currency, request, refresh }: { trades: Trade[]; proposals: Proposal[]; currency: string; request: Request; refresh: () => void }) {
+function TeamPortfolioPanel({ entry, brokerOrders }: { entry: TeamPortfolio; brokerOrders: BrokerOrder[] }) {
+  const portfolio = entry.portfolio;
+  return <Panel
+    title={`${entry.teamName} portfolio`}
+    icon={<Users size={16} />}
+    action={<span className="portfolio-total">{money(portfolio.totalValue, portfolio.currency)}</span>}
+  >
+    <TeamRoster members={entry.members} />
+    <div className="metric-strip four"><Metric label="Total value" value={money(portfolio.totalValue, portfolio.currency)} detail={`${money(portfolio.cash, portfolio.currency)} cash`} /><Metric label="Daily change" value={signedMoney(portfolio.dailyPnl, portfolio.currency)} detail={percent(portfolio.dailyReturn)} tone={tone(portfolio.dailyPnl)} /><Metric label="Total return" value={optionalPercent(portfolio.totalReturn)} detail={portfolio.initialCash === null ? "Baseline pending" : `${money(portfolio.initialCash, portfolio.currency)} funded`} tone={tone(portfolio.totalReturn ?? 0)} /><Metric label="Gross exposure" value={money(portfolio.grossExposure, portfolio.currency)} detail={percent(portfolio.grossExposure / (portfolio.totalValue || 1))} /></div>
+    {brokerOrders.length > 0 && <div className="portfolio-order-block"><span className="eyebrow">WORKING BROKER ORDERS</span><BrokerOrderTable orders={brokerOrders} teams={[]} compact /></div>}
+    <PositionTable positions={portfolio.positions} currency={portfolio.currency} compact />
+  </Panel>;
+}
+
+function TeamRoster({ members }: { members: FinanceTeamMember[] }) {
+  if (!members.length) return <div className="team-roster"><span className="member-chip">No assigned agents</span></div>;
+  return <ol className="team-roster">{members.map((member) => <li key={member.agentId} className={member.lead ? "lead" : ""}>
+    <span className="roster-rank">{member.rank}</span>
+    <div><strong>{member.displayName}</strong><small>{member.role ?? "Role unset"}</small></div>
+    {member.lead && <span className="lead-badge"><Crown size={11} /> Team lead</span>}
+  </li>)}</ol>;
+}
+
+function TeamPortfolioTotalPanel({ total }: { total: TeamPortfolioTotal }) {
+  return <Panel
+    title="All teams combined"
+    icon={<WalletCards size={16} />}
+    action={<span className="portfolio-total">{money(total.totalValue, total.currency)}</span>}
+  >
+    <div className="metric-strip four"><Metric label="Combined value" value={money(total.totalValue, total.currency)} detail={`${total.portfolioCount} team portfolio${total.portfolioCount === 1 ? "" : "s"}`} /><Metric label="Daily change" value={signedMoney(total.dailyPnl, total.currency)} detail={percent(total.dailyReturn)} tone={tone(total.dailyPnl)} /><Metric label="Total return" value={optionalPercent(total.totalReturn)} detail={`${money(total.initialCash, total.currency)} funded`} tone={tone(total.totalReturn ?? 0)} /><Metric label="Cash reserve" value={money(total.cash, total.currency)} detail={`${money(total.grossExposure, total.currency)} invested`} /></div>
+    <PositionTable positions={total.positions} currency={total.currency} />
+  </Panel>;
+}
+
+// The badge is the only place an operator sees whether real paper orders can leave the
+// building, so each execution mode gets its own words rather than a shared "read only".
+const MODE_LABEL: Record<Overview["mode"], string> = {
+  paper: "LOCAL PAPER",
+  "ibkr-paper-read-only": "IBKR PAPER / READ ONLY",
+  "ibkr-paper-dry-run": "IBKR PAPER / DRY RUN",
+  "ibkr-paper-live": "IBKR PAPER / LIVE ORDERS",
+};
+
+function TradesView({ trades, proposals, brokerOrders, financeTeams, teamPortfolios, defaultCurrency, mode, request, refresh }: { trades: Trade[]; proposals: Proposal[]; brokerOrders: BrokerOrder[]; financeTeams: FinanceTeam[]; teamPortfolios: TeamPortfolios; defaultCurrency: string; mode: Overview["mode"]; request: Request; refresh: () => void }) {
+  // In live mode the same button transmits a real paper order, so it must not keep calling
+  // itself a risk check.
+  const liveMode = mode === "ibkr-paper-live";
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  async function execute(id: string) { setBusy(id); setError(null); try { await request(`/proposals/${encodeURIComponent(id)}/execute`, { method: "POST" }); refresh(); } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); } finally { setBusy(null); } }
-  return <div className="view-stack"><div className="section-heading"><div><span className="eyebrow">DECISION PIPELINE</span><h2>Proposals and paper trades</h2></div></div>{error && <div className="error-banner">{error}</div>}<Panel title="Trade proposals" icon={<Target size={16} />}>{proposals.length ? <div className="table-wrap"><table><thead><tr><th>Decision</th><th>Agent</th><th>Order</th><th>Status</th><th>Created</th><th /></tr></thead><tbody>{proposals.map((proposal) => <tr key={proposal.id}><td><strong>{proposal.decisionId}</strong><small>{proposal.strategyId ?? "manual"}</small></td><td>{proposal.agentId}</td><td><span className={`side ${proposal.side.toLowerCase()}`}>{proposal.side}</span> {number(proposal.requestedQuantity)} {proposal.symbol}</td><td><Status value={proposal.status} /></td><td>{relative(proposal.createdAt)}</td><td>{proposal.status === "PROPOSED" && <button className="button small" onClick={() => void execute(proposal.id)} disabled={busy === proposal.id}>{busy === proposal.id ? <LoaderCircle className="spin" size={14} /> : <ShieldCheck size={14} />} Risk check</button>}</td></tr>)}</tbody></table></div> : <Empty text="No proposals are waiting for deterministic review." />}</Panel><Panel title="Executed paper trades" icon={<History size={16} />}>{trades.length ? <div className="table-wrap"><table><thead><tr><th>Security</th><th>Side</th><th>Quantity</th><th>Execution</th><th>Fee</th><th>Agent</th><th>Time</th></tr></thead><tbody>{trades.map((trade) => <tr key={trade.id}><td><strong>{trade.symbol}</strong></td><td><span className={`side ${trade.side.toLowerCase()}`}>{trade.side}</span></td><td>{number(trade.quantity)}</td><td>{money(trade.price, currency)}</td><td>{money(trade.fee, currency)}</td><td>{trade.agentId}</td><td>{relative(trade.executedAt)}</td></tr>)}</tbody></table></div> : <Empty text="No paper orders have passed risk review and executed." />}</Panel></div>;
+  const [dryRun, setDryRun] = useState<OrderPreview | null>(null);
+  const [live, setLive] = useState<LiveOrderResult | null>(null);
+  const [reconciling, setReconciling] = useState(false);
+  async function execute(id: string) {
+    setBusy(id); setError(null); setDryRun(null); setLive(null);
+    try {
+      const result = await request<OrderPreview | LiveOrderResult | unknown>(`/proposals/${encodeURIComponent(id)}/execute`, { method: "POST" });
+      // A dry run leaves the ledger untouched, so its only outcome is the broker preview.
+      if ((result as OrderPreview)?.mode === "dry-run") setDryRun(result as OrderPreview);
+      // A live order may still be working at the broker, which the trade table cannot show.
+      if ((result as LiveOrderResult)?.mode === "live") setLive(result as LiveOrderResult);
+      refresh();
+    } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); } finally { setBusy(null); }
+  }
+  async function reconcile() {
+    setReconciling(true); setError(null);
+    try {
+      const report = await request<ReconcileReport>("/broker/reconcile", { method: "POST" });
+      if (report.checked === 0) setError("No working broker orders to settle.");
+      refresh();
+    } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); } finally { setReconciling(false); }
+  }
+  return <div className="view-stack"><div className="section-heading"><div><span className="eyebrow">DECISION PIPELINE</span><h2>Proposals and paper trades</h2></div></div>{error && <div className="error-banner">{error}</div>}{dryRun && <DryRunNotice result={dryRun} close={() => setDryRun(null)} />}{live && <LiveOrderNotice result={live} close={() => setLive(null)} reconcile={reconcile} reconciling={reconciling} />}<Panel title="Trade proposals" icon={<Target size={16} />}>{proposals.length ? <div className="table-wrap"><table><thead><tr><th>Decision</th><th>Agent</th><th>Order</th><th>Status</th><th>Created</th><th /></tr></thead><tbody>{proposals.map((proposal) => { const teamProposal = financeTeams.some((team) => team.portfolioId === proposal.portfolioId); return <tr key={proposal.id}><td><strong>{proposal.decisionId}</strong><small>{proposal.strategyId ?? "manual"}</small></td><td>{proposal.agentId}</td><td><span className={`side ${proposal.side.toLowerCase()}`}>{proposal.side}</span> {number(proposal.requestedQuantity)} {proposal.symbol}</td><td><Status value={proposal.status} /></td><td>{relative(proposal.createdAt)}</td><td>{proposal.status === "PROPOSED" && !teamProposal && <button className="button small" onClick={() => void execute(proposal.id)} disabled={busy === proposal.id}>{busy === proposal.id ? <LoaderCircle className="spin" size={14} /> : <ShieldCheck size={14} />} {liveMode ? "Send order" : "Risk check"}</button>}</td></tr>; })}</tbody></table></div> : <Empty text="No proposals have been recorded." />}</Panel><Panel title="IBKR paper orders" icon={<Activity size={16} />}>{brokerOrders.length ? <BrokerOrderTable orders={brokerOrders} teams={financeTeams} /> : <Empty text="No IBKR paper orders have been submitted." />}</Panel><Panel title="Executed paper trades" icon={<History size={16} />}>{trades.length ? <div className="table-wrap"><table><thead><tr><th>Security</th><th>Side</th><th>Quantity</th><th>Execution</th><th>Fee</th><th>Agent</th><th>Time</th></tr></thead><tbody>{trades.map((trade) => { const currency = teamPortfolios.teams.find((team) => team.portfolio.id === trade.portfolioId)?.portfolio.currency ?? defaultCurrency; return <tr key={trade.id}><td><strong>{trade.symbol}</strong></td><td><span className={`side ${trade.side.toLowerCase()}`}>{trade.side}</span></td><td>{number(trade.quantity)}</td><td>{money(trade.price, currency)}</td><td>{money(trade.fee, currency)}</td><td>{trade.agentId}</td><td>{relative(trade.executedAt)}</td></tr>; })}</tbody></table></div> : <Empty text="No IBKR orders have filled and entered the paper ledger yet." />}</Panel></div>;
+}
+
+function BrokerOrderTable({ orders, teams, compact = false }: { orders: BrokerOrder[]; teams: FinanceTeam[]; compact?: boolean }) {
+  const teamByPortfolio = new Map(teams.map((team) => [team.portfolioId, team.name]));
+  return <div className="table-wrap"><table><thead><tr>{!compact && <th>Team</th>}<th>Security</th><th>Order</th><th>Filled</th><th>IBKR status</th><th>Ledger</th><th>Trader</th><th>Submitted</th></tr></thead><tbody>{orders.map((order) => <tr key={order.id}>{!compact && <td>{teamByPortfolio.get(order.portfolioId) ?? "Main"}</td>}<td><strong>{order.symbol}</strong></td><td><span className={`side ${order.side.toLowerCase()}`}>{order.side}</span> {number(order.quantity)} · {order.orderType}</td><td>{number(order.filledQuantity)} / {number(order.quantity)}</td><td><Status value={order.brokerStatus ?? "UNKNOWN"} /></td><td><Status value={order.status} /></td><td>{order.agentId}</td><td>{relative(order.createdAt)}</td></tr>)}</tbody></table></div>;
+}
+
+function DryRunNotice({ result, close }: { result: OrderPreview; close: () => void }) {
+  const order = result.preview;
+  const margin = order?.preview;
+  return <div className="dry-run-notice"><div><span className="eyebrow">IBKR PAPER DRY RUN · NOTHING PLACED</span>{order
+    ? <strong>{order.side} {number(order.quantity)} {order.symbol} · {order.orderType} · account {order.accountIdMasked}</strong>
+    : <strong>Risk engine approved no quantity; no order was previewed.</strong>}
+    {margin && <small>IBKR preview {margin.status} · initial margin {margin.initMarginChange === null ? "n/a" : money(margin.initMarginChange)} · fees {margin.commissionAndFees === null ? "n/a" : money(margin.commissionAndFees, margin.commissionAndFeesCurrency || "USD")}{margin.warningText ? ` · ${margin.warningText}` : ""}</small>}
+    {result.decision.reasons.length > 0 && <small>{result.decision.reasons.join(" · ")}</small>}
+  </div><button className="icon-button" title="Dismiss dry run" onClick={close}><X size={15} /></button></div>;
+}
+
+function LiveOrderNotice({ result, close, reconcile, reconciling }: { result: LiveOrderResult; close: () => void; reconcile: () => void; reconciling: boolean }) {
+  const order = result.brokerOrder;
+  const working = order?.status === "WORKING";
+  return <div className="dry-run-notice"><div>
+    <span className="eyebrow">{working ? "IBKR PAPER ORDER WORKING · NOT YET ON THE LEDGER" : "IBKR PAPER ORDER PLACED"}</span>
+    {order
+      ? <strong>{order.side} {number(order.quantity)} {order.symbol} · {order.orderType} · account {order.accountMasked}{order.brokerOrderId ? ` · broker order ${order.brokerOrderId}` : ""}</strong>
+      : <strong>Risk engine approved no quantity; no order was sent.</strong>}
+    {order && <small>IBKR status {order.brokerStatus ?? "unknown"} · filled {number(order.filledQuantity)} of {number(order.quantity)}{order.averageFillPrice === null ? "" : ` at ${money(order.averageFillPrice)}`}{order.fee === null ? "" : ` · fee ${money(order.fee)}`}</small>}
+    {working && <small>A working order is booked only once IBKR reports its fill and commission. Settle it when the fill lands.</small>}
+    {result.decision.reasons.length > 0 && <small>{result.decision.reasons.join(" · ")}</small>}
+    {working && <button className="button small" onClick={() => void reconcile()} disabled={reconciling}>{reconciling ? <LoaderCircle className="spin" size={14} /> : <History size={14} />} Settle working orders</button>}
+  </div><button className="icon-button" title="Dismiss order receipt" onClick={close}><X size={15} /></button></div>;
 }
 
 function PredictionsView({ predictions, request, refresh }: { predictions: Prediction[]; request: Request; refresh: () => void }) {
@@ -250,6 +368,8 @@ function AgentsView({ agents, financeAgents, financeTeams, request, refresh }: {
   const [availableAgents, setAvailableAgents] = useState<OrionAgent[]>([]);
   const [assignOpen, setAssignOpen] = useState(false);
   const [teamOpen, setTeamOpen] = useState(false);
+  const [teamToUpdate, setTeamToUpdate] = useState<FinanceTeam | null>(null);
+  const [memberToRemove, setMemberToRemove] = useState<{ team: FinanceTeam; member: FinanceTeamMember } | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -296,16 +416,32 @@ function AgentsView({ agents, financeAgents, financeTeams, request, refresh }: {
     finally { setBusyId(null); }
   }
 
+  async function promoteTeamLead(team: FinanceTeam, member: FinanceTeamMember) {
+    setBusyId(`lead:${team.id}:${member.agentId}`); setError(null);
+    try { await request(`/finance-teams/${encodeURIComponent(team.id)}/lead`, { method: "POST", body: JSON.stringify({ agentId: member.agentId }) }); refresh(); setMemberToRemove(null); }
+    catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); }
+    finally { setBusyId(null); }
+  }
+
+  async function removeTeamMember(team: FinanceTeam, member: FinanceTeamMember) {
+    setBusyId(`member:${team.id}:${member.agentId}`); setError(null);
+    try { await request(`/finance-teams/${encodeURIComponent(team.id)}/members/${encodeURIComponent(member.agentId)}`, { method: "DELETE" }); refresh(); setMemberToRemove(null); }
+    catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); }
+    finally { setBusyId(null); }
+  }
+
   const assignedIds = new Set(financeAgents.map((agent) => agent.agentId));
   return <div className="view-stack">
     <div className="section-heading agent-management-heading"><div><span className="eyebrow">FINANCE AGENT OPERATIONS</span><h2>Assignments and teams</h2><p>Assign existing Orion agents, then group assigned agents into finance teams. A team is ready with one to five members.</p></div><div className="section-actions"><button className="button" onClick={() => { setAssignOpen(true); void loadAvailableAgents(); }}><UserPlus size={15} />Assign agent</button><button className="button primary" onClick={() => setTeamOpen(true)} disabled={!financeAgents.length || financeTeams.length >= 5}><Users size={15} />Create team</button></div></div>
     {error && <div className="error-banner"><span>{error}</span><button title="Dismiss" onClick={() => setError(null)}><X size={15} /></button></div>}
     <div className="team-metric-strip"><Metric label="Assigned agents" value={`${financeAgents.length}`} detail={`${availableAgents.length || "No"} available in Orion`} /><Metric label="Finance teams" value={`${financeTeams.length} / 5`} detail="Up to five teams" /><Metric label="Team capacity" value="1–5" detail="Agents per operating team" /></div>
     <div className="two-panels"><Panel title="Assigned finance agents" icon={<UserPlus size={16} />} action={<TextButton onClick={() => setAssignOpen(true)}>Assign</TextButton>}>{financeAgents.length ? <div className="finance-agent-list">{financeAgents.map((agent) => <article key={agent.agentId}><div><strong>{agent.displayName}</strong><small>{agent.agentId}{agent.role ? ` · ${agent.role}` : ""}</small></div><button className="icon-button small-icon" title={`Remove ${agent.displayName} from Finance Lab`} onClick={() => void remove(agent)} disabled={busyId === agent.agentId}>{busyId === agent.agentId ? <LoaderCircle size={14} className="spin" /> : <Trash2 size={14} />}</button></article>)}</div> : <Empty text="No agents are assigned. Use Assign agent to choose from Orion Agent Room." />}</Panel>
-      <Panel title="Finance teams" icon={<Users size={16} />} action={<TextButton onClick={() => setTeamOpen(true)}>Create</TextButton>}>{financeTeams.length ? <div className="finance-team-list">{financeTeams.map((team) => <article key={team.id}><header><div><strong>{team.name}</strong><small>{team.members.length} / 5 agents</small></div><button className="icon-button small-icon" title={`Delete ${team.name}`} onClick={() => void removeTeam(team)} disabled={busyId === `team:${team.id}`}>{busyId === `team:${team.id}` ? <LoaderCircle size={14} className="spin" /> : <Trash2 size={14} />}</button></header><div className="team-members">{team.members.map((member) => <span key={member.agentId}>{member.displayName}</span>)}</div></article>)}</div> : <Empty text="No finance teams yet. Teams can operate with one to five assigned agents." />}</Panel></div>
+      <Panel title="Finance teams" icon={<Users size={16} />} action={<TextButton onClick={() => setTeamOpen(true)}>Create</TextButton>}>{financeTeams.length ? <div className="finance-team-list">{financeTeams.map((team) => <article key={team.id}><header><div><strong>{team.name}</strong><small>{team.members.length} / 5 agents · lead {team.members.find((member) => member.lead)?.displayName ?? "unset"}</small></div><div className="team-actions"><button className="button small" onClick={() => setTeamToUpdate(team)} disabled={team.members.length >= 5}><UserPlus size={14} />Add agents</button><button className="icon-button small-icon" title={`Delete ${team.name}`} onClick={() => void removeTeam(team)} disabled={busyId === `team:${team.id}`}>{busyId === `team:${team.id}` ? <LoaderCircle size={14} className="spin" /> : <Trash2 size={14} />}</button></div></header><div className="team-members">{team.members.map((member) => <button className={member.lead ? "team-member lead" : "team-member"} key={member.agentId} title={`${member.displayName} · rank ${member.rank}${member.lead ? " · team lead" : ""}`} onClick={() => setMemberToRemove({ team, member })}>{member.lead && <Crown size={11} aria-hidden="true" />}<span>{member.displayName}</span><X size={11} aria-hidden="true" /></button>)}</div></article>)}</div> : <Empty text="No finance teams yet. Teams can operate with one to five assigned agents." />}</Panel></div>
     <Panel title="Agent scorecard" icon={<Bot size={16} />}>{agents.length ? <div className="table-wrap"><table><thead><tr><th>Agent ID</th><th>Predictions</th><th>Directional accuracy</th><th>Avg alpha</th><th>Calibration</th><th>Paper trades</th></tr></thead><tbody>{agents.map((agent) => <tr key={agent.agentId}><td><strong>{agent.agentId}</strong></td><td>{agent.evaluatedPredictions} / {agent.totalPredictions}</td><td>{optionalPercent(agent.directionalAccuracy)}</td><td className={tone(agent.averageAlpha ?? 0)}>{optionalPercent(agent.averageAlpha)}</td><td><Status value={agent.confidenceCalibration.status} /></td><td>{agent.tradeCount}</td></tr>)}</tbody></table></div> : <Empty text="No agent finance history exists yet. Agent creation remains in Orion Agent Room." />}</Panel>
     {assignOpen && <AssignFinanceAgentDialog availableAgents={availableAgents} assignedIds={assignedIds} busyId={busyId} assign={assign} close={() => setAssignOpen(false)} />}
     {teamOpen && <CreateFinanceTeamDialog financeAgents={financeAgents} teamCount={financeTeams.length} request={request} refresh={refresh} close={() => setTeamOpen(false)} />}
+    {teamToUpdate && <AddFinanceTeamMembersDialog team={teamToUpdate} financeAgents={financeAgents} request={request} refresh={refresh} close={() => setTeamToUpdate(null)} />}
+    {memberToRemove && <FinanceTeamMemberDialog team={memberToRemove.team} member={memberToRemove.member} busy={busyId === `member:${memberToRemove.team.id}:${memberToRemove.member.agentId}` || busyId === `lead:${memberToRemove.team.id}:${memberToRemove.member.agentId}`} promote={() => void promoteTeamLead(memberToRemove.team, memberToRemove.member)} remove={() => void removeTeamMember(memberToRemove.team, memberToRemove.member)} close={() => setMemberToRemove(null)} />}
   </div>;
 }
 
@@ -333,6 +469,34 @@ function CreateFinanceTeamDialog({ financeAgents, teamCount, request, refresh, c
   function toggle(agentId: string) { setMemberIds((ids) => ids.includes(agentId) ? ids.filter((id) => id !== agentId) : ids.length < 5 ? [...ids, agentId] : ids); }
   async function submit(event: FormEvent) { event.preventDefault(); setBusy(true); setError(null); try { await request("/finance-teams", { method: "POST", body: JSON.stringify({ name, agentIds: memberIds }) }); refresh(); close(); } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); } finally { setBusy(false); } }
   return <div className="modal-backdrop" onMouseDown={(event) => { if (event.currentTarget === event.target) close(); }}><section className="modal team-modal"><header><div><span className="eyebrow">FINANCE TEAM {teamCount + 1} / 5</span><h2>Create finance team</h2></div><button className="icon-button" title="Close team creation" onClick={close}><X size={17} /></button></header><form className="team-form" onSubmit={submit}><label><span>Team name</span><input required value={name} onChange={(event) => setName(event.target.value)} maxLength={120} placeholder="Research desk" /></label><div className="team-form-heading"><span>Assigned agents</span><small>{memberIds.length} / 5 selected</small></div><div className="team-picker">{financeAgents.map((agent) => { const checked = memberIds.includes(agent.agentId); return <label key={agent.agentId}><input type="checkbox" checked={checked} onChange={() => toggle(agent.agentId)} disabled={!checked && memberIds.length >= 5} /><span><strong>{agent.displayName}</strong><small>{agent.agentId}{agent.role ? ` · ${agent.role}` : ""}</small></span></label>; })}</div>{error && <p className="form-error">{error}</p>}<p className="team-helper">A team is ready as soon as it has one assigned agent. Five is the maximum, not a requirement.</p><button className="button primary" disabled={busy || !name.trim() || !memberIds.length}>{busy ? <LoaderCircle size={15} className="spin" /> : <Users size={15} />}Create team</button></form></section></div>;
+}
+
+function AddFinanceTeamMembersDialog({ team, financeAgents, request, refresh, close }: {
+  team: FinanceTeam;
+  financeAgents: FinanceAgent[];
+  request: Request;
+  refresh: () => void;
+  close: () => void;
+}) {
+  const [memberIds, setMemberIds] = useState<string[]>([]);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const available = financeAgents.filter((agent) => !team.members.some((member) => member.agentId === agent.agentId));
+  const remainingCapacity = 5 - team.members.length;
+  function toggle(agentId: string) { setMemberIds((ids) => ids.includes(agentId) ? ids.filter((id) => id !== agentId) : ids.length < remainingCapacity ? [...ids, agentId] : ids); }
+  async function submit(event: FormEvent) { event.preventDefault(); setBusy(true); setError(null); try { await request(`/finance-teams/${encodeURIComponent(team.id)}/members`, { method: "POST", body: JSON.stringify({ agentIds: memberIds }) }); refresh(); close(); } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); } finally { setBusy(false); } }
+  return <div className="modal-backdrop" onMouseDown={(event) => { if (event.currentTarget === event.target) close(); }}><section className="modal team-modal"><header><div><span className="eyebrow">{team.name.toUpperCase()}</span><h2>Add agents</h2></div><button className="icon-button" title="Close add agents" onClick={close}><X size={17} /></button></header><form className="team-form" onSubmit={submit}><div className="team-form-heading"><span>Assigned agents</span><small>{memberIds.length} / {remainingCapacity} selected</small></div><div className="team-picker">{available.length ? available.map((agent) => { const checked = memberIds.includes(agent.agentId); return <label key={agent.agentId}><input type="checkbox" checked={checked} onChange={() => toggle(agent.agentId)} disabled={!checked && memberIds.length >= remainingCapacity} /><span><strong>{agent.displayName}</strong><small>{agent.agentId}{agent.role ? ` · ${agent.role}` : ""}</small></span></label>; }) : <Empty text="All assigned Finance Lab agents are already in this team." />}</div>{error && <p className="form-error">{error}</p>}<button className="button primary" disabled={busy || !memberIds.length}>{busy ? <LoaderCircle size={15} className="spin" /> : <UserPlus size={15} />}Add selected agents</button></form></section></div>;
+}
+
+function FinanceTeamMemberDialog({ team, member, busy, promote, remove, close }: {
+  team: FinanceTeam;
+  member: FinanceTeamMember;
+  busy: boolean;
+  promote: () => void;
+  remove: () => void;
+  close: () => void;
+}) {
+  return <div className="modal-backdrop" onMouseDown={(event) => { if (event.currentTarget === event.target) close(); }}><section className="modal confirmation-modal"><header><div><span className="eyebrow">{team.name.toUpperCase()} · RANK {member.rank}</span><h2>{member.displayName}</h2></div><button className="icon-button" title="Close member actions" onClick={close} disabled={busy}><X size={17} /></button></header><p>{member.role ?? "Role unset"}{member.lead ? " · leads this team" : ` · reports to ${team.members.find((entry) => entry.lead)?.displayName ?? "no lead"}`}</p><div className="confirmation-actions"><button className="button" onClick={close} disabled={busy}>Cancel</button>{!member.lead && <button className="button" onClick={promote} disabled={busy}>{busy ? <LoaderCircle size={15} className="spin" /> : <Crown size={15} />}Make team lead</button>}<button className="button danger" onClick={remove} disabled={busy}>{busy ? <LoaderCircle size={15} className="spin" /> : <Trash2 size={15} />}Remove from team</button></div></section></div>;
 }
 
 function StrategiesView({ strategies, request, onResearch }: { strategies: Strategy[]; request: Request; onResearch: (result: StrategyRun) => void }) {

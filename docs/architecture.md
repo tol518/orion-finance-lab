@@ -45,24 +45,49 @@ flowchart LR
 
 `FINANCE_BROKER_MODE=ibkr-paper` creates a loopback-only `IbkrGatewayClient`. The Node client invokes a one-shot Python bridge using IBKR's official `ibapi` package, verifies that the explicitly configured account is present, and reads account summary plus positions. It never chooses an account implicitly and exposes only a masked account identifier to the dashboard.
 
-During read-only verification, IBKR balances and positions replace the local default portfolio snapshot. The local SQLite database still owns proposals, evidence, predictions, audit records, experiments, and historical valuations. `trade.execute` fails with `IBKR_READ_ONLY`; it cannot fall through to `PaperBroker`.
+IBKR balances and positions replace the local default portfolio snapshot. The local SQLite database still owns proposals, evidence, predictions, audit records, experiments, and historical valuations.
+
+`FINANCE_IBKR_EXECUTION` decides what execution may reach the broker, and it is `off` by default: `trade.execute` fails with `IBKR_READ_ONLY` and cannot fall through to `PaperBroker`. In `dry-run`, the deterministic risk engine sizes the order and the bridge places it with IBKR `Order.whatIf`, so IBKR validates the contract, account, and margin impact and returns a preview without ever placing an order. No trade, position, or valuation is written from a preview. The order account is always pinned to the allowlisted paper account, re-resolved per order.
+
+`live` transmits a real paper order. IB Gateway must also have **Read-Only API** unchecked in Configuration → API → Settings; while it is checked, IBKR refuses even a `whatIf` preview with error 321.
+
+### Booking a live fill
+
+A live order is the broker's event, not the lab's, so the lab does not decide what it cost:
+
+- Each accepted order becomes a `broker_orders` row holding IBKR's `permId` — the only order identifier stable across API sessions — plus the per-session client order id, the masked account, and IBKR's own status.
+- The order is booked into `orders` and `trades` only when filled quantity, average fill price, and IBKR's commission report are all known. A fill whose commission has not arrived yet stays `WORKING`; nothing is written at an assumed fee.
+- Cash and positions move through the same ledger path as a simulated fill, so the two can never disagree about a portfolio. The recorded slippage is `0`: a real fill carries its slippage inside the executed price.
+- `POST /broker/reconcile` re-reads IBKR's open orders and executions and settles anything still working. A booked order leaves `WORKING`, and a unique index on `broker_orders.broker_order_id` means the same IBKR order can never be booked twice.
+- Before transmission, Finance Lab atomically persists the risk decision and moves the proposal to `SUBMITTING`. The proposal ID is sent as IBKR `orderRef`, allowing reconciliation to adopt an open order or execution if the placing request times out after transmission.
+- Missing from one open-order/execution snapshot is treated as ambiguous, not cancelled. Only an explicit terminal broker status can cancel an unfilled order.
+- An order IBKR reports as terminal with nothing filled is marked `CANCELLED` and its proposal returns to `REJECTED` rather than resting forever.
+- A proposal that already has a broker order is refused before transmission, so a repeated execute cannot send a duplicate order to IBKR.
+
+## Team portfolios and hierarchy
+
+Every finance team owns one paper portfolio, and `finance_team_members.team_rank` orders the team with rank 1 as its lead. A non-lead member whose assigned role contains `Trader` creates the proposal. The current rank-1 lead must approve it, and the same trader then submits it to the broker. Approval records the lead identity and becomes invalid if leadership changes before submission. Agents read their own place in the hierarchy through `GET /finance-teams/context` rather than being told it in a prompt.
 
 ## Decision and execution flow
 
 ```mermaid
 sequenceDiagram
-  participant A as ORION agent
-  participant T as OpenClaw finance tool
+  participant T as Trader agent
+  participant L as Team-lead agent
+  participant O as OpenClaw finance tool
   participant F as FinanceLabService
   participant R as RiskEngine
   participant B as PaperBroker
   participant D as SQLite
 
-  A->>T: create proposal
-  T->>F: trusted agent ID + trade.propose
+  T->>O: create proposal
+  O->>F: trusted trader ID + trade.propose
   F->>D: immutable evidence + PROPOSED record
-  A->>T: execute proposal ID
-  T->>F: trusted agent ID + trade.execute
+  L->>O: approve proposal ID
+  O->>F: trusted lead ID + trade.execute
+  F->>D: LEAD_APPROVED + approving lead
+  T->>O: execute proposal ID
+  O->>F: same trusted trader ID + trade.execute
   F->>F: current quote + portfolio valuation
   F->>R: proposal, quote, portfolio, policy
   R-->>F: APPROVED / RESIZED / REJECTED

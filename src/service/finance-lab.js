@@ -26,6 +26,13 @@ import {
   stringArray,
 } from "../api/validation.js";
 
+// The header has to say what the broker may actually do, not just that IBKR is attached.
+const IBKR_OVERVIEW_MODE = Object.freeze({
+  off: "ibkr-paper-read-only",
+  "dry-run": "ibkr-paper-dry-run",
+  live: "ibkr-paper-live",
+});
+
 export const FINANCE_PERMISSIONS = Object.freeze([
   "market.read",
   "portfolio.read",
@@ -51,6 +58,7 @@ export class FinanceLabService {
     provider,
     broker,
     riskPolicy,
+    ibkrExecution = "off",
     tradingAgents = {},
     logger = console,
   } = {}) {
@@ -62,6 +70,7 @@ export class FinanceLabService {
     });
     this.riskEngine = new RiskEngine(riskPolicy);
     this.ibkrBroker = broker ?? null;
+    this.ibkrExecution = ibkrExecution;
     this.predictions = new PredictionService({ store: this.store, marketData: this.marketData });
     this.strategies = new StrategyRegistry([
       new QuantStrategy({ marketData: this.marketData }),
@@ -70,6 +79,7 @@ export class FinanceLabService {
       new TradingAgentsStrategy({ ...tradingAgents, logger }),
     ]);
     this.defaultPortfolio = this.store.ensureDefaultPortfolio();
+    this.store.ensureTeamPortfolios();
     this.evaluationTimer = null;
     this.executionQueues = new Map();
   }
@@ -275,6 +285,21 @@ export class FinanceLabService {
     return Promise.all(this.store.listPortfolios().map((portfolio) => this.getPortfolio(actor, portfolio.id)));
   }
 
+  // Each finance team owns its own paper portfolio; `total` is the roll-up the dashboard
+  // shows next to them so operators never add the team numbers by hand.
+  async listTeamPortfolios(actor) {
+    assertPermission(actor, "portfolio.read");
+    const teams = await Promise.all(this.store.listFinanceTeams().map(async (team) => ({
+      teamId: team.id,
+      teamName: team.name,
+      leadAgentId: team.leadAgentId,
+      members: team.members,
+      createdAt: team.createdAt,
+      portfolio: await this.getPortfolio(actor, team.portfolioId, { recordValuation: false }),
+    })));
+    return { teams, total: aggregatePortfolios(teams.map((team) => team.portfolio)) };
+  }
+
   listTrades(actor, options = {}) {
     assertPermission(actor, "portfolio.read");
     return this.store.listTrades({
@@ -286,9 +311,37 @@ export class FinanceLabService {
 
   listProposals(actor, options = {}) {
     assertPermission(actor, "portfolio.read");
+    if (!actor.operator) {
+      const team = this.store.listFinanceTeams().find((entry) =>
+        entry.members.some((member) => member.agentId === trustedAgentId(actor)),
+      );
+      if (team?.leadAgentId === trustedAgentId(actor)) {
+        return this.store.listProposals({
+          ...options,
+          portfolioId: team.portfolioId,
+          limit: boundedLimit(options.limit),
+        });
+      }
+    }
     return this.store.listProposals({
       ...options,
       agentId: actor.operator ? options.agentId : trustedAgentId(actor),
+      limit: boundedLimit(options.limit),
+    });
+  }
+
+  listBrokerOrders(actor, options = {}) {
+    assertPermission(actor, "portfolio.read");
+    if (actor.operator) {
+      return this.store.listBrokerOrders({ ...options, limit: boundedLimit(options.limit) });
+    }
+    const agentId = trustedAgentId(actor);
+    const team = this.store.listFinanceTeams().find((entry) =>
+      entry.members.some((member) => member.agentId === agentId),
+    );
+    return this.store.listBrokerOrders({
+      ...options,
+      ...(team ? { portfolioId: team.portfolioId } : { agentId }),
       limit: boundedLimit(options.limit),
     });
   }
@@ -300,7 +353,8 @@ export class FinanceLabService {
     if (!portfolio) {
       throw new FinanceError("Portfolio not found", { code: "PORTFOLIO_NOT_FOUND", status: 404 });
     }
-    assertPortfolioMutationAccess(actor, portfolio, this.defaultPortfolio.id);
+    const team = this.#assertPortfolioAccess(actor, portfolio);
+    if (team) this.#assertTeamTrader(actor, team, "create trade proposals");
     const symbol = normalizeSymbol(input.symbol);
     const side = enumValue(input.side, "side", ["BUY", "SELL"]);
     const quantity = positiveNumber(input.quantity, "quantity", { max: 1_000_000 });
@@ -340,24 +394,69 @@ export class FinanceLabService {
     });
   }
 
+  approveTradeProposal(actor, proposalId) {
+    assertPermission(actor, "trade.execute");
+    const proposal = this.store.getProposal(requiredString(proposalId, "proposalId", { max: 128 }));
+    if (!proposal) throw new FinanceError("Trade proposal not found", { code: "PROPOSAL_NOT_FOUND", status: 404 });
+    if (!["PROPOSED", "LEAD_APPROVED"].includes(proposal.status)) {
+      throw new FinanceError("Trade proposal has already been resolved", {
+        code: "PROPOSAL_ALREADY_RESOLVED",
+        status: 409,
+      });
+    }
+    const portfolio = this.store.getPortfolio(proposal.portfolioId);
+    if (!portfolio) throw new FinanceError("Portfolio not found", { code: "PORTFOLIO_NOT_FOUND", status: 404 });
+    const team = this.#assertPortfolioAccess(actor, portfolio);
+    if (!team) {
+      throw new FinanceError("Team-lead approval applies only to finance team portfolios", {
+        code: "FINANCE_TEAM_REQUIRED",
+        status: 409,
+      });
+    }
+    if (team.leadAgentId !== trustedAgentId(actor)) {
+      throw new FinanceError("Only the finance team lead can approve its trade proposals", {
+        code: "FINANCE_TEAM_LEAD_REQUIRED",
+        status: 403,
+        details: { leadAgentId: team.leadAgentId },
+      });
+    }
+    const proposer = team.members.find((member) => member.agentId === proposal.agentId);
+    if (!proposer || proposer.lead || !isTraderRole(proposer.role)) {
+      throw new FinanceError("A team lead may approve only a proposal created by one of the team's trader agents", {
+        code: "FINANCE_TEAM_TRADER_REQUIRED",
+        status: 409,
+      });
+    }
+    return this.#audited("trade.approve", actor, proposal, () =>
+      this.store.approveProposal({ proposalId: proposal.id, leadAgentId: trustedAgentId(actor) }),
+    );
+  }
+
   async executePaperTrade(actor, proposalId) {
     assertPermission(actor, "trade.execute");
     const proposal = this.store.getProposal(requiredString(proposalId, "proposalId", { max: 128 }));
     if (!proposal) throw new FinanceError("Trade proposal not found", { code: "PROPOSAL_NOT_FOUND", status: 404 });
-    if (!actor.operator && proposal.agentId !== trustedAgentId(actor)) {
+    if (!["PROPOSED", "LEAD_APPROVED"].includes(proposal.status)) {
+      throw new FinanceError("Trade proposal has already been resolved", {
+        code: "PROPOSAL_ALREADY_RESOLVED",
+        status: 409,
+      });
+    }
+    const portfolio = this.store.getPortfolio(proposal.portfolioId);
+    if (!portfolio) throw new FinanceError("Portfolio not found", { code: "PORTFOLIO_NOT_FOUND", status: 404 });
+    const team = this.#assertPortfolioAccess(actor, portfolio);
+    this.#assertExecutionAuthority(actor, team, portfolio, proposal);
+    // Outside team books, a proposal stays private to the agent that raised it.
+    if (!actor.operator && !team && proposal.agentId !== trustedAgentId(actor)) {
       throw new FinanceError("An agent cannot execute another agent's proposal", {
         code: "FORBIDDEN_PROPOSAL",
         status: 403,
       });
     }
-    const portfolio = this.store.getPortfolio(proposal.portfolioId);
-    if (!portfolio) throw new FinanceError("Portfolio not found", { code: "PORTFOLIO_NOT_FOUND", status: 404 });
-    assertPortfolioMutationAccess(actor, portfolio, this.defaultPortfolio.id);
     if (this.ibkrBroker) {
-      throw new FinanceError("IBKR paper execution is locked while the API is in read-only verification", {
-        code: "IBKR_READ_ONLY",
-        status: 409,
-      });
+      return this.ibkrExecution === "live"
+        ? this.#serializeExecution(proposal.portfolioId, () => this.#executeIbkrOrder(actor, proposal.id))
+        : this.#previewIbkrOrder(actor, proposal, portfolio);
     }
     return this.#serializeExecution(proposal.portfolioId, () =>
       this.#audited("trade.execute", actor, proposal, async () => {
@@ -530,11 +629,133 @@ export class FinanceLabService {
     }));
   }
 
+  promoteFinanceTeamLead(actor, teamId, agentId) {
+    assertOperator(actor);
+    const normalizedTeamId = requiredString(teamId, "teamId", { max: 128 });
+    const normalizedAgentId = normalizeAgentId(requiredString(agentId, "agentId", { max: 128 }));
+    return this.#audited("finance.team.lead", actor, { teamId: normalizedTeamId }, () => {
+      const team = this.store.setFinanceTeamLead(normalizedTeamId, normalizedAgentId);
+      if (!team) {
+        throw new FinanceError("That agent is not a member of this finance team", {
+          code: "FINANCE_TEAM_MEMBER_NOT_FOUND",
+          status: 404,
+        });
+      }
+      return team;
+    });
+  }
+
+  // Agent-facing view of the hierarchy: who I am, who leads my team, who my peers are,
+  // and which paper portfolio my decisions belong to. Agents read this instead of being
+  // told their place in a prompt that can drift from the stored team.
+  getFinanceTeamContext(actor, agentId) {
+    assertPermission(actor, "portfolio.read");
+    const requested = agentId === undefined || agentId === null || agentId === ""
+      ? null
+      : normalizeAgentId(requiredString(agentId, "agentId", { max: 128 }));
+    const subjectId = actor.operator ? requested ?? trustedAgentId(actor) : trustedAgentId(actor);
+    if (requested && requested !== subjectId) {
+      throw new FinanceError("An agent can only read its own finance team context", {
+        code: "FORBIDDEN_TEAM_CONTEXT",
+        status: 403,
+      });
+    }
+    const teams = this.store.listFinanceTeams();
+    const team = teams.find((entry) => entry.members.some((member) => member.agentId === subjectId));
+    if (!team) {
+      throw new FinanceError("This agent is not assigned to a finance team", {
+        code: "FINANCE_TEAM_NOT_FOUND",
+        status: 404,
+      });
+    }
+    const self = team.members.find((member) => member.agentId === subjectId);
+    const lead = team.members.find((member) => member.lead) ?? null;
+    return {
+      agentId: self.agentId,
+      displayName: self.displayName,
+      role: self.role,
+      rank: self.rank,
+      isLead: self.lead,
+      reportsTo: self.lead ? null : lead?.agentId ?? null,
+      team: {
+        id: team.id,
+        name: team.name,
+        portfolioId: team.portfolioId,
+        memberCount: team.members.length,
+        leadAgentId: team.leadAgentId,
+      },
+      members: team.members.map((member) => ({
+        agentId: member.agentId,
+        displayName: member.displayName,
+        role: member.role,
+        rank: member.rank,
+        isLead: member.lead,
+      })),
+      peerTeams: teams
+        .filter((entry) => entry.id !== team.id)
+        .map((entry) => ({ id: entry.id, name: entry.name, memberCount: entry.members.length })),
+    };
+  }
+
   removeFinanceTeam(actor, teamId) {
     assertOperator(actor);
     const normalized = requiredString(teamId, "teamId", { max: 128 });
     return this.#audited("finance.team.remove", actor, { teamId: normalized }, () => ({
       removed: this.store.removeFinanceTeam(normalized),
+    }));
+  }
+
+  addFinanceTeamMembers(actor, teamId, input) {
+    assertOperator(actor);
+    const normalized = requiredString(teamId, "teamId", { max: 128 });
+    const team = this.store.getFinanceTeam(normalized);
+    if (!team) {
+      throw new FinanceError("Finance team not found", { code: "FINANCE_TEAM_NOT_FOUND", status: 404 });
+    }
+    const agentIds = [...new Set(stringArray(input.agentIds, "agentIds", { maxItems: 5, maxLength: 128 }).map(normalizeAgentId))];
+    if (!agentIds.length) {
+      throw new FinanceError("Select at least one agent to add", { code: "FINANCE_TEAM_REQUIRES_AGENT" });
+    }
+    const remainingCapacity = 5 - team.members.length;
+    const newAgentIds = agentIds.filter((agentId) => !team.members.some((member) => member.agentId === agentId));
+    if (newAgentIds.length > remainingCapacity) {
+      throw new FinanceError("Finance teams support at most five agents", {
+        code: "FINANCE_TEAM_MEMBER_LIMIT_REACHED",
+        status: 409,
+      });
+    }
+    const assignedIds = new Set(this.store.listFinanceAgents().map((entry) => entry.agentId));
+    const unassigned = newAgentIds.find((agentId) => !assignedIds.has(agentId));
+    if (unassigned) {
+      throw new FinanceError("Every team member must first be assigned to Finance Lab", {
+        code: "FINANCE_AGENT_NOT_ASSIGNED",
+        details: { agentId: unassigned },
+      });
+    }
+    return this.#audited("finance.team.members.add", actor, { teamId: normalized, agentIds: newAgentIds }, () =>
+      this.store.addFinanceTeamMembers(normalized, newAgentIds),
+    );
+  }
+
+  removeFinanceTeamMember(actor, teamId, agentId) {
+    assertOperator(actor);
+    const normalizedTeamId = requiredString(teamId, "teamId", { max: 128 });
+    const normalizedAgentId = normalizeAgentId(agentId);
+    const team = this.store.getFinanceTeam(normalizedTeamId);
+    if (!team) {
+      throw new FinanceError("Finance team not found", { code: "FINANCE_TEAM_NOT_FOUND", status: 404 });
+    }
+    if (team.members.length <= 1 && team.members.some((member) => member.agentId === normalizedAgentId)) {
+      throw new FinanceError("A finance team needs at least one agent; delete the team instead", {
+        code: "FINANCE_TEAM_REQUIRES_AGENT",
+        status: 409,
+      });
+    }
+    return this.#audited("finance.team.member.remove", actor, {
+      teamId: normalizedTeamId,
+      agentId: normalizedAgentId,
+    }, () => ({
+      removed: this.store.removeFinanceTeamMember(normalizedTeamId, normalizedAgentId),
     }));
   }
 
@@ -627,28 +848,333 @@ export class FinanceLabService {
   }
 
   async overview(actor) {
-    const [portfolio, experiments, agents, strategies, financeAgents, financeTeams] = await Promise.all([
+    const [portfolio, experiments, agents, strategies, financeAgents, financeTeams, teamPortfolios] = await Promise.all([
       this.getPortfolio(actor),
       Promise.resolve(this.listExperiments(actor)),
       Promise.resolve(this.listAgentPerformance(actor)),
       this.compareStrategies(actor),
       Promise.resolve(this.listFinanceAgents(actor)),
       Promise.resolve(this.listFinanceTeams(actor)),
+      this.listTeamPortfolios(actor),
     ]);
     return {
-      mode: this.ibkrBroker ? "ibkr-paper-read-only" : "paper",
+      mode: this.ibkrBroker ? IBKR_OVERVIEW_MODE[this.ibkrExecution] : "paper",
       generatedAt: new Date().toISOString(),
       portfolio,
       risk: this.#riskEngineForPortfolio(portfolio).state(portfolio),
-      recentTrades: this.store.listTrades({ portfolioId: portfolio.id, limit: 8 }),
-      recentProposals: this.store.listProposals({ portfolioId: portfolio.id, limit: 8 }),
+      // The operator dashboard is a Finance Lab activity view, not the legacy default
+      // portfolio's audit trail. Agent callers remain scoped by the public list methods.
+      recentTrades: this.listTrades(actor, { limit: 20 }),
+      recentProposals: this.listProposals(actor, { limit: 20 }),
+      recentBrokerOrders: this.listBrokerOrders(actor, { limit: 20 }),
       recentPredictions: this.store.listPredictions({ limit: 8 }),
       experiments,
       agents,
       financeAgents,
       financeTeams,
+      teamPortfolios,
       strategies,
     };
+  }
+
+  // Team portfolios are team property: any member may propose into its own team book,
+  // and no agent may touch another team's. Non-team portfolios keep the older rule.
+  #assertPortfolioAccess(actor, portfolio) {
+    const team = this.store.getFinanceTeamByPortfolio(portfolio.id);
+    if (actor.operator) return team;
+    if (team) {
+      if (!team.members.some((member) => member.agentId === trustedAgentId(actor))) {
+        throw new FinanceError("An agent cannot modify another finance team's portfolio", {
+          code: "FORBIDDEN_PORTFOLIO",
+          status: 403,
+        });
+      }
+      return team;
+    }
+    assertPortfolioMutationAccess(actor, portfolio, this.defaultPortfolio.id);
+    return null;
+  }
+
+  // Team execution is intentionally split across two identities: the rank-1 lead approves,
+  // then the non-lead trader who created the proposal submits it to the broker.
+  #assertExecutionAuthority(actor, team, portfolio, proposal) {
+    if (!team) {
+      if (actor.operator) return;
+      // Agent-owned experiment portfolios keep their existing access rule; only the
+      // broker-backed account portfolio is narrowed to operators.
+      if (this.ibkrBroker && portfolio.id === this.defaultPortfolio.id) {
+        throw new FinanceError("Only an operator can execute against the broker account portfolio", {
+          code: "FORBIDDEN_PORTFOLIO",
+          status: 403,
+        });
+      }
+      return;
+    }
+    this.#assertTeamTrader(actor, team, "submit team orders");
+    if (proposal.agentId !== trustedAgentId(actor)) {
+      throw new FinanceError("Only the trader who created the proposal can submit it", {
+        code: "FORBIDDEN_PROPOSAL",
+        status: 403,
+      });
+    }
+    if (
+      proposal.status !== "LEAD_APPROVED" ||
+      proposal.leadApprovedByAgentId !== team.leadAgentId
+    ) {
+      throw new FinanceError("The current finance team lead must approve this proposal before submission", {
+        code: "FINANCE_TEAM_APPROVAL_REQUIRED",
+        status: 409,
+        details: { leadAgentId: team.leadAgentId },
+      });
+    }
+  }
+
+  #assertTeamTrader(actor, team, action) {
+    if (actor.operator) {
+      throw new FinanceError(`Only a team trader agent can ${action}`, {
+        code: "FINANCE_TEAM_TRADER_REQUIRED",
+        status: 403,
+      });
+    }
+    const member = team.members.find((entry) => entry.agentId === trustedAgentId(actor));
+    if (!member) {
+      throw new FinanceError("An agent cannot act on another finance team's portfolio", {
+        code: "FORBIDDEN_PORTFOLIO",
+        status: 403,
+      });
+    }
+    if (member.lead || !isTraderRole(member.role)) {
+      throw new FinanceError(`Only a non-lead trader agent can ${action}`, {
+        code: "FINANCE_TEAM_TRADER_REQUIRED",
+        status: 403,
+        details: { leadAgentId: team.leadAgentId },
+      });
+    }
+    return member;
+  }
+
+  // IBKR paper orders are previewed through whatIf: IBKR validates the contract, account,
+  // and margin impact without placing anything. Nothing is written to the team ledger.
+  async #previewIbkrOrder(actor, proposal, portfolio) {
+    this.#assertIbkrExecutionEnabled();
+    return this.#audited("trade.preview", actor, proposal, async () => {
+      const decision = await this.#sizeIbkrOrder(actor, proposal, portfolio);
+      if (decision.approvedQuantity <= 0) {
+        return { mode: "dry-run", broker: "ibkr", decision, preview: null };
+      }
+      const preview = await this.ibkrBroker.placeOrder({
+        symbol: proposal.symbol,
+        side: proposal.side,
+        quantity: decision.approvedQuantity,
+        orderType: "MKT",
+        whatIf: true,
+      });
+      return { mode: "dry-run", broker: "ibkr", decision, preview };
+    });
+  }
+
+  // Live mode transmits a real paper order. The broker's own fill is the ledger entry, so a
+  // fill that has not fully arrived yet is left as a working broker order for reconciliation
+  // rather than booked at an assumed price or fee.
+  async #executeIbkrOrder(actor, proposalId) {
+    this.#assertIbkrExecutionEnabled();
+    // Placing an order is an irreversible side effect at the broker, so a proposal that
+    // already has one is refused here rather than by the store guard after transmission.
+    // The portfolio execution queue is what makes this check safe against a concurrent send.
+    const proposal = this.store.getProposal(proposalId);
+    if (!proposal || proposal.status !== "LEAD_APPROVED") {
+      throw new FinanceError("Trade proposal is no longer ready for broker submission", {
+        code: "PROPOSAL_ALREADY_RESOLVED",
+        status: 409,
+      });
+    }
+    const portfolio = this.store.getPortfolio(proposal.portfolioId);
+    const team = this.#assertPortfolioAccess(actor, portfolio);
+    this.#assertExecutionAuthority(actor, team, portfolio, proposal);
+    return this.#audited("trade.execute", actor, proposal, async () => {
+      if (this.store.hasInFlightBrokerOrder(portfolio.id)) {
+        throw new FinanceError("This team portfolio already has an in-flight broker order", {
+          code: "BROKER_ORDER_IN_FLIGHT",
+          status: 409,
+        });
+      }
+      const decision = await this.#sizeIbkrOrder(actor, proposal, portfolio);
+      if (decision.approvedQuantity <= 0) {
+        return { mode: "live", broker: "ibkr", decision, order: null, trade: null, brokerOrder: null };
+      }
+      const claim = this.store.claimProposalForBroker({
+        proposalId: proposal.id,
+        leadAgentId: proposal.leadApprovedByAgentId,
+        traderAgentId: proposal.agentId,
+        decision,
+      });
+      const claimed = claim.proposal;
+      let placed;
+      try {
+        placed = await this.ibkrBroker.placeOrder({
+          symbol: claimed.symbol,
+          side: claimed.side,
+          quantity: decision.approvedQuantity,
+          orderType: "MKT",
+          whatIf: false,
+          orderRef: claimed.id,
+        });
+      } catch (error) {
+        // Only an explicit broker rejection proves no order exists. Timeouts and transport
+        // failures stay SUBMITTING so the owning trader can reconcile before any retry.
+        if (error?.code === "IBKR_ORDER_REJECTED") this.store.releaseBrokerProposalClaim(claimed.id);
+        throw error;
+      }
+      const settled = this.store.applyBrokerDecision({
+        proposal: claimed,
+        decision,
+        settlement: placed.settlement,
+        accountMasked: placed.accountIdMasked,
+        riskEventId: claim.riskEventId,
+      });
+      return {
+        mode: "live",
+        broker: "ibkr",
+        decision,
+        brokerOrder: settled.brokerOrder,
+        order: settled.order,
+        trade: settled.trade,
+        proposal: settled.proposal,
+      };
+    });
+  }
+
+  // Working orders are settled from what IBKR reports now, not from what the placing call
+  // happened to see, so a fill that landed after the request returned is still booked once.
+  async reconcileBrokerOrders(actor, options = {}) {
+    assertPermission(actor, "trade.execute");
+    if (!this.ibkrBroker) {
+      throw new FinanceError("Broker reconciliation requires IBKR paper mode", {
+        code: "IBKR_NOT_CONFIGURED",
+        status: 409,
+      });
+    }
+    this.#assertIbkrExecutionEnabled();
+    const portfolioId = this.#reconcileScope(actor, options.portfolioId);
+    const working = this.store.listWorkingBrokerOrders({ portfolioId });
+    const submitting = this.store.listSubmittingProposals({ portfolioId });
+    if (working.length === 0 && submitting.length === 0) {
+      return { broker: "ibkr", checked: 0, settled: [], stillWorking: [], pendingSubmissions: 0 };
+    }
+    const report = await this.ibkrBroker.reconcile();
+    const settled = [];
+    const stillWorking = [];
+    let pendingSubmissions = 0;
+    for (const proposal of submitting) {
+      const decision = this.store.getBrokerSubmissionDecision(proposal.id);
+      const settlement = decision ? submissionSettlement(report, proposal, decision) : null;
+      if (!decision || !settlement) {
+        pendingSubmissions += 1;
+        continue;
+      }
+      const outcome = await this.#serializeExecution(proposal.portfolioId, async () =>
+        this.store.applyBrokerDecision({
+          proposal,
+          decision,
+          settlement,
+          accountMasked: report.accountIdMasked,
+          riskEventId: decision.riskEventId,
+        }),
+      );
+      (outcome.brokerOrder.status === "WORKING" ? stillWorking : settled).push(outcome.brokerOrder);
+    }
+    for (const brokerOrder of working) {
+      const brokerMatch = [...report.openOrders, ...(report.completedOrders ?? [])].find((item) =>
+        item.brokerOrderId === brokerOrder.brokerOrderId ||
+        item.clientOrderId === brokerOrder.clientOrderId ||
+        item.orderRef === brokerOrder.proposalId,
+      );
+      const resolvedBrokerOrderId = brokerMatch?.brokerOrderId ?? brokerOrder.brokerOrderId;
+      if (resolvedBrokerOrderId && resolvedBrokerOrderId !== brokerOrder.brokerOrderId) {
+        this.store.upgradeBrokerOrderIdentity(brokerOrder.id, resolvedBrokerOrderId);
+      }
+      const executions = report.executionsByBrokerOrderId[resolvedBrokerOrderId] ??
+        Object.values(report.executionsByBrokerOrderId).find((item) => item.orderRef === brokerOrder.proposalId);
+      const completed = (report.completedOrders ?? []).find((item) =>
+        item.brokerOrderId === resolvedBrokerOrderId || item.orderRef === brokerOrder.proposalId,
+      );
+      const open = report.openOrders.find((item) =>
+        item.brokerOrderId === resolvedBrokerOrderId || item.orderRef === brokerOrder.proposalId,
+      );
+      // Snapshot absence is ambiguous after reconnects or date boundaries. Only an explicit
+      // terminal broker callback may cancel an order; otherwise retain its last known state.
+      const status = completed?.status ?? open?.status ?? (executions ? "Filled" : brokerOrder.brokerStatus ?? "UNKNOWN");
+      const outcome = await this.#serializeExecution(brokerOrder.portfolioId, async () =>
+        this.store.settleBrokerOrder(brokerOrder.id, {
+          status,
+          filledQuantity: executions?.filledQuantity ?? brokerOrder.filledQuantity,
+          averageFillPrice: executions?.averageFillPrice ?? brokerOrder.averageFillPrice,
+          commission: executions ? executions.commission : brokerOrder.fee,
+          executionIds: executions
+            ? executions.executions.map((item) => String(item.executionId))
+            : brokerOrder.executionIds,
+        }),
+      );
+      (outcome.brokerOrder.status === "WORKING" ? stillWorking : settled).push(outcome.brokerOrder);
+    }
+    return {
+      broker: "ibkr",
+      checked: working.length + submitting.length,
+      settled,
+      stillWorking,
+      pendingSubmissions,
+      retrievedAt: report.retrievedAt,
+    };
+  }
+
+  // Settling follows submission ownership: a non-lead trader may settle only its team's
+  // broker orders, while the lead remains the approval identity.
+  #reconcileScope(actor, requestedPortfolioId) {
+    const requested = optionalString(requestedPortfolioId, "portfolioId", { max: 128 });
+    if (actor.operator) {
+      throw new FinanceError("Only a team trader agent can settle team broker orders", {
+        code: "FINANCE_TEAM_TRADER_REQUIRED",
+        status: 403,
+      });
+    }
+    const teams = this.store.listFinanceTeams();
+    const team = teams.find((entry) => entry.members.some((member) => member.agentId === trustedAgentId(actor)));
+    if (!team) {
+      throw new FinanceError("This agent is not assigned to a finance team", {
+        code: "FINANCE_TEAM_NOT_FOUND",
+        status: 404,
+      });
+    }
+    this.#assertTeamTrader(actor, team, "settle team broker orders");
+    if (requested && requested !== team.portfolioId) {
+      throw new FinanceError("An agent cannot settle another finance team's broker orders", {
+        code: "FORBIDDEN_PORTFOLIO",
+        status: 403,
+      });
+    }
+    return team.portfolioId;
+  }
+
+  #assertIbkrExecutionEnabled() {
+    if (this.ibkrExecution === "off") {
+      throw new FinanceError("IBKR paper execution is disabled; set FINANCE_IBKR_EXECUTION to enable it", {
+        code: "IBKR_READ_ONLY",
+        status: 409,
+      });
+    }
+  }
+
+  async #sizeIbkrOrder(actor, proposal, portfolio) {
+    const [valuedPortfolio, quoteEnvelope] = await Promise.all([
+      this.getPortfolio({ ...actor, permissions: new Set([...actor.permissions, "portfolio.read"]) }, portfolio.id, { recordValuation: false }),
+      this.marketData.quote(proposal.symbol),
+    ]);
+    return this.#riskEngineForPortfolio(valuedPortfolio).evaluate({
+      proposal,
+      portfolio: valuedPortfolio,
+      quote: quoteEnvelope.data,
+      executionCosts: { feeBps: 1, minimumFee: 0.25, slippageBps: 2 },
+    });
   }
 
   async #audited(action, actor, refs, work) {
@@ -726,12 +1252,80 @@ export class FinanceLabService {
   }
 }
 
+function submissionSettlement(report, proposal, decision) {
+  const open = report.openOrders.find((item) => item.orderRef === proposal.id);
+  const completed = (report.completedOrders ?? []).find((item) => item.orderRef === proposal.id);
+  const executionMatch = Object.entries(report.executionsByBrokerOrderId)
+    .find(([, executions]) => executions.orderRef === proposal.id);
+  if (!open && !completed && !executionMatch) return null;
+  const [executionBrokerOrderId, executions] = executionMatch ?? [];
+  const filledQuantity = executions?.filledQuantity ?? 0;
+  return {
+    brokerOrderId: executionBrokerOrderId ?? open?.brokerOrderId ?? completed.brokerOrderId,
+    clientOrderId: open?.clientOrderId ?? completed?.clientOrderId ?? null,
+    status: completed?.status ?? open?.status ?? (filledQuantity >= decision.approvedQuantity ? "Filled" : "UNKNOWN"),
+    filledQuantity,
+    remainingQuantity: Math.max(0, decision.approvedQuantity - filledQuantity),
+    averageFillPrice: executions?.averageFillPrice ?? null,
+    commission: executions?.commission ?? null,
+    executionIds: (executions?.executions ?? []).map((item) => String(item.executionId)),
+  };
+}
+
 export function createActor({ actorId, agentId, permissions, operator = false }) {
   return {
     actorId: requiredString(actorId ?? agentId, "actorId", { max: 128 }),
     agentId: normalizeAgentId(agentId),
     operator,
     permissions: new Set(Array.isArray(permissions) ? permissions.filter((item) => FINANCE_PERMISSIONS.includes(item)) : []),
+  };
+}
+
+function aggregatePortfolios(portfolios) {
+  const positions = new Map();
+  for (const portfolio of portfolios) {
+    for (const position of portfolio.positions) {
+      const merged = positions.get(position.symbol) ?? {
+        symbol: position.symbol,
+        quantity: 0,
+        costBasis: 0,
+        price: position.price,
+        marketValue: 0,
+        unrealisedPnl: 0,
+        dailyPnl: 0,
+        quoteError: null,
+      };
+      merged.quantity += position.quantity;
+      merged.costBasis += position.quantity * position.averageCost;
+      merged.price = position.price;
+      merged.marketValue += position.marketValue;
+      merged.unrealisedPnl += position.unrealisedPnl;
+      merged.dailyPnl += position.dailyPnl;
+      merged.quoteError ??= position.quoteError;
+      positions.set(position.symbol, merged);
+    }
+  }
+  const sum = (pick) => portfolios.reduce((total, portfolio) => total + pick(portfolio), 0);
+  const totalValue = sum((portfolio) => portfolio.totalValue);
+  const dailyPnl = sum((portfolio) => portfolio.dailyPnl);
+  const initialCash = sum((portfolio) => portfolio.initialCash ?? 0);
+  const openingValue = totalValue - dailyPnl;
+  return {
+    portfolioCount: portfolios.length,
+    currency: portfolios[0]?.currency ?? "USD",
+    cash: sum((portfolio) => portfolio.cash),
+    initialCash,
+    totalValue,
+    grossExposure: sum((portfolio) => portfolio.grossExposure),
+    dailyPnl,
+    dailyReturn: openingValue > 0 ? dailyPnl / openingValue : 0,
+    totalReturn: initialCash > 0 ? totalValue / initialCash - 1 : null,
+    positions: [...positions.values()]
+      .map(({ costBasis, ...position }) => ({
+        ...position,
+        averageCost: position.quantity > 0 ? costBasis / position.quantity : 0,
+      }))
+      .sort((left, right) => right.marketValue - left.marketValue),
   };
 }
 
@@ -756,6 +1350,10 @@ function assertOperator(actor) {
 function trustedAgentId(actor) {
   if (!actor?.agentId) throw new FinanceError("Trusted agent identity is required", { code: "AGENT_ID_REQUIRED", status: 401 });
   return normalizeAgentId(actor.agentId);
+}
+
+function isTraderRole(role) {
+  return typeof role === "string" && /(^|\W)trader(\W|$)/i.test(role);
 }
 
 function assertPortfolioMutationAccess(actor, portfolio, defaultPortfolioId) {

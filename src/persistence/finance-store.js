@@ -5,6 +5,11 @@ import { DatabaseSync } from "node:sqlite";
 import { FinanceError } from "../api/validation.js";
 
 const DEFAULT_PORTFOLIO_ID = "paper-main";
+// IBKR will send nothing further about an order in one of these states, so a settlement
+// pass may stop waiting for a fill that is never coming.
+const TERMINAL_BROKER_STATUS = new Set(["Filled", "Cancelled", "ApiCancelled", "Inactive"]);
+const EXECUTABLE_PROPOSAL_STATUS = new Set(["PROPOSED", "LEAD_APPROVED", "SUBMITTING"]);
+const TEAM_PORTFOLIO_INITIAL_CAPITAL = 100_000;
 
 export class FinanceStore {
   constructor({ filename = ":memory:" } = {}) {
@@ -59,6 +64,8 @@ export class FinanceStore {
         evidence_manifest_id TEXT,
         status TEXT NOT NULL,
         approved_quantity REAL,
+        lead_approved_by_agent_id TEXT,
+        lead_approved_at TEXT,
         created_at TEXT NOT NULL,
         resolved_at TEXT
       );
@@ -194,6 +201,9 @@ export class FinanceStore {
         team_id TEXT NOT NULL REFERENCES finance_teams(id) ON DELETE CASCADE,
         agent_id TEXT NOT NULL REFERENCES finance_agents(agent_id) ON DELETE CASCADE,
         assigned_at TEXT NOT NULL,
+        -- Hierarchy position inside the team. Rank 1 is the team lead; ranks stay
+        -- contiguous so removing the lead promotes the next member automatically.
+        team_rank INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY (team_id, agent_id)
       );
 
@@ -218,6 +228,38 @@ export class FinanceStore {
         gross_exposure_cents INTEGER NOT NULL,
         recorded_at TEXT NOT NULL
       );
+
+      -- A broker order has a lifecycle the paper ledger does not: it can rest unfilled at
+      -- IBKR for minutes. It is booked into orders/trades only once quantity, price and fee
+      -- are all known, and order_id is the link proving that happened exactly once.
+      CREATE TABLE IF NOT EXISTS broker_orders (
+        id TEXT PRIMARY KEY,
+        proposal_id TEXT NOT NULL UNIQUE REFERENCES trade_proposals(id),
+        portfolio_id TEXT NOT NULL REFERENCES portfolios(id),
+        agent_id TEXT NOT NULL,
+        broker TEXT NOT NULL,
+        broker_order_id TEXT,
+        client_order_id INTEGER,
+        account_masked TEXT NOT NULL,
+        symbol TEXT NOT NULL,
+        side TEXT NOT NULL CHECK (side IN ('BUY', 'SELL')),
+        quantity REAL NOT NULL CHECK (quantity > 0),
+        order_type TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('WORKING', 'FILLED', 'CANCELLED')),
+        broker_status TEXT,
+        filled_quantity REAL NOT NULL DEFAULT 0,
+        average_fill_price_cents INTEGER,
+        fee_cents INTEGER,
+        order_id TEXT UNIQUE REFERENCES orders(id),
+        execution_ids_json TEXT NOT NULL DEFAULT '[]',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      -- Two proposals must never claim the same IBKR order, so reconciliation cannot
+      -- double-book a fill onto the ledger.
+      CREATE UNIQUE INDEX IF NOT EXISTS broker_orders_broker_order_id
+        ON broker_orders(broker_order_id) WHERE broker_order_id IS NOT NULL;
 
       CREATE TABLE IF NOT EXISTS audit_log (
         id TEXT PRIMARY KEY,
@@ -256,6 +298,71 @@ export class FinanceStore {
       this.db.exec("ALTER TABLE portfolio_valuations ADD COLUMN high_value_cents INTEGER");
       this.db.exec("UPDATE portfolio_valuations SET high_value_cents = total_value_cents");
     }
+    const teamColumns = new Set(
+      this.db.prepare("PRAGMA table_info(finance_teams)").all().map((column) => column.name),
+    );
+    if (!teamColumns.has("portfolio_id")) {
+      this.db.exec("ALTER TABLE finance_teams ADD COLUMN portfolio_id TEXT REFERENCES portfolios(id)");
+    }
+    const memberColumns = new Set(
+      this.db.prepare("PRAGMA table_info(finance_team_members)").all().map((column) => column.name),
+    );
+    if (!memberColumns.has("team_rank")) {
+      this.db.exec("ALTER TABLE finance_team_members ADD COLUMN team_rank INTEGER NOT NULL DEFAULT 0");
+    }
+    const proposalColumns = new Set(
+      this.db.prepare("PRAGMA table_info(trade_proposals)").all().map((column) => column.name),
+    );
+    if (!proposalColumns.has("lead_approved_by_agent_id")) {
+      this.db.exec("ALTER TABLE trade_proposals ADD COLUMN lead_approved_by_agent_id TEXT");
+    }
+    if (!proposalColumns.has("lead_approved_at")) {
+      this.db.exec("ALTER TABLE trade_proposals ADD COLUMN lead_approved_at TEXT");
+    }
+    // Rows written before the column existed carry rank 0; assignment order becomes the
+    // hierarchy, so the first agent added to each team becomes its lead.
+    for (const team of this.db.prepare("SELECT DISTINCT team_id FROM finance_team_members WHERE team_rank < 1").all()) {
+      this.#recompactTeamRanks(team.team_id);
+    }
+  }
+
+  // Ranks are rewritten as a contiguous 1..N sequence in current order, so rank 1 always
+  // names exactly one lead and no gap survives a member removal.
+  #recompactTeamRanks(teamId) {
+    this.#writeTeamRanks(teamId, this.#orderedTeamMemberIds(teamId));
+  }
+
+  // Unranked rows sort last so a backfill keeps assignment order for legacy memberships.
+  #orderedTeamMemberIds(teamId) {
+    return this.db.prepare(`
+      SELECT agent_id FROM finance_team_members
+      WHERE team_id = ?
+      ORDER BY CASE WHEN team_rank < 1 THEN 1 ELSE 0 END, team_rank, assigned_at, agent_id
+    `).all(teamId).map((row) => row.agent_id);
+  }
+
+  #writeTeamRanks(teamId, agentIds) {
+    const update = this.db.prepare("UPDATE finance_team_members SET team_rank = ? WHERE team_id = ? AND agent_id = ?");
+    agentIds.forEach((agentId, index) => update.run(index + 1, teamId, agentId));
+  }
+
+  // Every finance team owns exactly one paper portfolio. Teams created before the column
+  // existed are backfilled here so the dashboard never has to handle a team without one.
+  ensureTeamPortfolios() {
+    const orphans = this.db
+      .prepare("SELECT id, name FROM finance_teams WHERE portfolio_id IS NULL ORDER BY created_at, name")
+      .all();
+    for (const team of orphans) this.#attachTeamPortfolio(team.id, team.name);
+    return this.listFinanceTeams();
+  }
+
+  #attachTeamPortfolio(teamId, name) {
+    const portfolio = this.createPortfolio({
+      name: `${name} Team Portfolio`,
+      initialCapital: TEAM_PORTFOLIO_INITIAL_CAPITAL,
+    });
+    this.db.prepare("UPDATE finance_teams SET portfolio_id = ? WHERE id = ?").run(portfolio.id, teamId);
+    return portfolio;
   }
 
   ensureDefaultPortfolio() {
@@ -394,6 +501,74 @@ export class FinanceStore {
     return row ? mapProposal(row) : null;
   }
 
+  approveProposal({ proposalId, leadAgentId }) {
+    const approvedAt = new Date().toISOString();
+    const result = this.db.prepare(`
+      UPDATE trade_proposals
+      SET status = 'LEAD_APPROVED', lead_approved_by_agent_id = ?, lead_approved_at = ?
+      WHERE id = ? AND status = 'PROPOSED'
+    `).run(leadAgentId, approvedAt, proposalId);
+    if (result.changes !== 1) {
+      throw new FinanceError("Trade proposal is not waiting for team-lead approval", {
+        code: "PROPOSAL_NOT_AWAITING_APPROVAL",
+        status: 409,
+      });
+    }
+    return this.getProposal(proposalId);
+  }
+
+  claimProposalForBroker({ proposalId, leadAgentId, traderAgentId, decision }) {
+    const proposal = this.getProposal(proposalId);
+    const riskEventId = randomUUID();
+    const now = new Date().toISOString();
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const result = this.db.prepare(`
+        UPDATE trade_proposals SET status = 'SUBMITTING', approved_quantity = ?
+        WHERE id = ? AND status = 'LEAD_APPROVED'
+          AND lead_approved_by_agent_id = ? AND agent_id = ?
+      `).run(decision.approvedQuantity, proposalId, leadAgentId, traderAgentId);
+      if (result.changes !== 1) {
+        throw new FinanceError("Trade proposal is no longer ready for broker submission", {
+          code: "PROPOSAL_ALREADY_RESOLVED",
+          status: 409,
+        });
+      }
+      this.db.prepare(`
+        INSERT INTO risk_events (
+          id, proposal_id, portfolio_id, agent_id, status, requested_quantity,
+          approved_quantity, reasons_json, policy_json, snapshot_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        riskEventId, proposal.id, proposal.portfolioId, proposal.agentId, decision.status,
+        proposal.requestedQuantity, decision.approvedQuantity, JSON.stringify(decision.reasons),
+        JSON.stringify(decision.policy), JSON.stringify(decision.snapshot), now,
+      );
+      this.db.exec("COMMIT");
+      return { proposal: this.getProposal(proposalId), riskEventId };
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  releaseBrokerProposalClaim(proposalId) {
+    const proposal = this.getProposal(proposalId);
+    const team = proposal ? this.getFinanceTeamByPortfolio(proposal.portfolioId) : null;
+    const approvalStillCurrent = team?.leadAgentId === proposal?.leadApprovedByAgentId;
+    this.db.prepare(`
+      UPDATE trade_proposals SET status = ?, approved_quantity = NULL,
+        lead_approved_by_agent_id = ?, lead_approved_at = ?
+      WHERE id = ? AND status = 'SUBMITTING'
+    `).run(
+      approvalStillCurrent ? "LEAD_APPROVED" : "PROPOSED",
+      approvalStillCurrent ? proposal.leadApprovedByAgentId : null,
+      approvalStillCurrent ? proposal.leadApprovedAt : null,
+      proposalId,
+    );
+    return this.getProposal(proposalId);
+  }
+
   listProposals({ portfolioId, agentId, limit = 50 } = {}) {
     const filters = [];
     const values = [];
@@ -405,8 +580,90 @@ export class FinanceStore {
     return rows.map(mapProposal);
   }
 
+  listSubmittingProposals({ portfolioId } = {}) {
+    const where = portfolioId ? "AND portfolio_id = ?" : "";
+    const values = portfolioId ? [portfolioId] : [];
+    return this.db.prepare(
+      `SELECT * FROM trade_proposals WHERE status = 'SUBMITTING' ${where} ORDER BY created_at`,
+    ).all(...values).map(mapProposal);
+  }
+
+  getBrokerSubmissionDecision(proposalId) {
+    const row = this.db.prepare(`
+      SELECT * FROM risk_events WHERE proposal_id = ? ORDER BY created_at DESC LIMIT 1
+    `).get(proposalId);
+    if (!row) return null;
+    return {
+      riskEventId: row.id,
+      status: row.status,
+      approvedQuantity: Number(row.approved_quantity),
+      reasons: JSON.parse(row.reasons_json),
+      policy: JSON.parse(row.policy_json),
+      snapshot: JSON.parse(row.snapshot_json),
+    };
+  }
+
+  // Cash and position movement for one fill. Paper simulation and a real broker fill differ
+  // only in where price and fee come from, so both book through this single path; letting
+  // them drift would let the two ledgers disagree about the same portfolio.
+  #applyFillToLedger({ portfolioId, symbol, side, quantity, priceCents, feeCents, now }) {
+    const portfolioRow = this.db.prepare("SELECT * FROM portfolios WHERE id = ?").get(portfolioId);
+    if (!portfolioRow) throw new FinanceError("Portfolio not found", { code: "PORTFOLIO_NOT_FOUND", status: 404 });
+    const positionRow = this.db.prepare(
+      "SELECT * FROM positions WHERE portfolio_id = ? AND symbol = ?",
+    ).get(portfolioId, symbol);
+    const notionalCents = Math.round(priceCents * quantity);
+    const currentCash = Number(portfolioRow.cash_cents);
+    const currentQuantity = Number(positionRow?.quantity ?? 0);
+    const currentAverage = Number(positionRow?.average_cost_cents ?? 0);
+    let nextCash;
+    let nextQuantity;
+    let nextAverage;
+    let nextRealised = Number(positionRow?.realised_pnl_cents ?? 0);
+
+    if (side === "BUY") {
+      const debit = notionalCents + feeCents;
+      if (debit > currentCash) {
+        throw new FinanceError("Approved order exceeds available cash", {
+          code: "INSUFFICIENT_CASH",
+          status: 409,
+        });
+      }
+      nextCash = currentCash - debit;
+      nextQuantity = currentQuantity + quantity;
+      nextAverage = Math.round((currentQuantity * currentAverage + notionalCents + feeCents) / nextQuantity);
+    } else {
+      if (quantity > currentQuantity) {
+        throw new FinanceError("Approved sell exceeds held quantity", {
+          code: "INSUFFICIENT_POSITION",
+          status: 409,
+        });
+      }
+      nextCash = currentCash + notionalCents - feeCents;
+      nextQuantity = currentQuantity - quantity;
+      nextAverage = nextQuantity === 0 ? 0 : currentAverage;
+      nextRealised += Math.round((priceCents - currentAverage) * quantity - feeCents);
+    }
+
+    this.db.prepare("UPDATE portfolios SET cash_cents = ?, updated_at = ? WHERE id = ?")
+      .run(nextCash, now, portfolioId);
+    if (nextQuantity === 0) {
+      this.db.prepare("DELETE FROM positions WHERE portfolio_id = ? AND symbol = ?").run(portfolioId, symbol);
+      return;
+    }
+    this.db.prepare(`
+      INSERT INTO positions (portfolio_id, symbol, quantity, average_cost_cents, realised_pnl_cents, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(portfolio_id, symbol) DO UPDATE SET
+        quantity = excluded.quantity,
+        average_cost_cents = excluded.average_cost_cents,
+        realised_pnl_cents = excluded.realised_pnl_cents,
+        updated_at = excluded.updated_at
+    `).run(portfolioId, symbol, nextQuantity, nextAverage, nextRealised, now);
+  }
+
   applyPaperDecision({ proposal, decision, quotePrice, feeCents, slippageBps }) {
-    if (proposal.status !== "PROPOSED") {
+    if (!EXECUTABLE_PROPOSAL_STATUS.has(proposal.status)) {
       throw new FinanceError("Trade proposal has already been resolved", {
         code: "PROPOSAL_ALREADY_RESOLVED",
         status: 409,
@@ -443,65 +700,20 @@ export class FinanceStore {
         return { proposal: this.getProposal(proposal.id), riskEventId, order: null, trade: null };
       }
 
-      const portfolioRow = this.db.prepare("SELECT * FROM portfolios WHERE id = ?").get(proposal.portfolioId);
-      if (!portfolioRow) throw new FinanceError("Portfolio not found", { code: "PORTFOLIO_NOT_FOUND", status: 404 });
-      const positionRow = this.db.prepare(
-        "SELECT * FROM positions WHERE portfolio_id = ? AND symbol = ?",
-      ).get(proposal.portfolioId, proposal.symbol);
       const quantity = decision.approvedQuantity;
       const executionPrice = proposal.side === "BUY"
         ? quotePrice * (1 + slippageBps / 10_000)
         : quotePrice * (1 - slippageBps / 10_000);
       const priceCents = toCents(executionPrice);
-      const notionalCents = Math.round(priceCents * quantity);
-      const currentCash = Number(portfolioRow.cash_cents);
-      const currentQuantity = Number(positionRow?.quantity ?? 0);
-      const currentAverage = Number(positionRow?.average_cost_cents ?? 0);
-      let nextCash;
-      let nextQuantity;
-      let nextAverage;
-      let nextRealised = Number(positionRow?.realised_pnl_cents ?? 0);
-
-      if (proposal.side === "BUY") {
-        const debit = notionalCents + feeCents;
-        if (debit > currentCash) {
-          throw new FinanceError("Approved order exceeds available cash", {
-            code: "INSUFFICIENT_CASH",
-            status: 409,
-          });
-        }
-        nextCash = currentCash - debit;
-        nextQuantity = currentQuantity + quantity;
-        nextAverage = Math.round((currentQuantity * currentAverage + notionalCents + feeCents) / nextQuantity);
-      } else {
-        if (quantity > currentQuantity) {
-          throw new FinanceError("Approved sell exceeds held quantity", {
-            code: "INSUFFICIENT_POSITION",
-            status: 409,
-          });
-        }
-        nextCash = currentCash + notionalCents - feeCents;
-        nextQuantity = currentQuantity - quantity;
-        nextAverage = nextQuantity === 0 ? 0 : currentAverage;
-        nextRealised += Math.round((priceCents - currentAverage) * quantity - feeCents);
-      }
-
-      this.db.prepare("UPDATE portfolios SET cash_cents = ?, updated_at = ? WHERE id = ?")
-        .run(nextCash, now, proposal.portfolioId);
-      if (nextQuantity === 0) {
-        this.db.prepare("DELETE FROM positions WHERE portfolio_id = ? AND symbol = ?")
-          .run(proposal.portfolioId, proposal.symbol);
-      } else {
-        this.db.prepare(`
-          INSERT INTO positions (portfolio_id, symbol, quantity, average_cost_cents, realised_pnl_cents, updated_at)
-          VALUES (?, ?, ?, ?, ?, ?)
-          ON CONFLICT(portfolio_id, symbol) DO UPDATE SET
-            quantity = excluded.quantity,
-            average_cost_cents = excluded.average_cost_cents,
-            realised_pnl_cents = excluded.realised_pnl_cents,
-            updated_at = excluded.updated_at
-        `).run(proposal.portfolioId, proposal.symbol, nextQuantity, nextAverage, nextRealised, now);
-      }
+      this.#applyFillToLedger({
+        portfolioId: proposal.portfolioId,
+        symbol: proposal.symbol,
+        side: proposal.side,
+        quantity,
+        priceCents,
+        feeCents,
+        now,
+      });
 
       const orderId = randomUUID();
       const tradeId = randomUUID();
@@ -556,6 +768,224 @@ export class FinanceStore {
       this.db.exec("ROLLBACK");
       throw error;
     }
+  }
+
+  // A live broker order is booked onto the ledger only when the fill is complete: quantity,
+  // average price and the broker's own commission all known. Anything else stays a
+  // broker_orders row for reconciliation, so no trade is ever written with an invented fee.
+  applyBrokerDecision({ proposal, decision, settlement, accountMasked, riskEventId, broker = "ibkr", orderType = "MKT" }) {
+    if (!EXECUTABLE_PROPOSAL_STATUS.has(proposal.status)) {
+      throw new FinanceError("Trade proposal has already been resolved", {
+        code: "PROPOSAL_ALREADY_RESOLVED",
+        status: 409,
+      });
+    }
+    const now = new Date().toISOString();
+    const resolvedRiskEventId = riskEventId ?? randomUUID();
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      if (!riskEventId) this.db.prepare(`
+        INSERT INTO risk_events (
+          id, proposal_id, portfolio_id, agent_id, status, requested_quantity,
+          approved_quantity, reasons_json, policy_json, snapshot_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        resolvedRiskEventId,
+        proposal.id,
+        proposal.portfolioId,
+        proposal.agentId,
+        decision.status,
+        proposal.requestedQuantity,
+        decision.approvedQuantity,
+        JSON.stringify(decision.reasons),
+        JSON.stringify(decision.policy),
+        JSON.stringify(decision.snapshot),
+        now,
+      );
+
+      const brokerOrderRowId = randomUUID();
+      this.db.prepare(`
+        INSERT INTO broker_orders (
+          id, proposal_id, portfolio_id, agent_id, broker, broker_order_id, client_order_id,
+          account_masked, symbol, side, quantity, order_type, status, broker_status,
+          filled_quantity, average_fill_price_cents, fee_cents, execution_ids_json,
+          created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'WORKING', ?, 0, NULL, NULL, '[]', ?, ?)
+      `).run(
+        brokerOrderRowId,
+        proposal.id,
+        proposal.portfolioId,
+        proposal.agentId,
+        broker,
+        settlement.brokerOrderId ?? null,
+        settlement.clientOrderId ?? null,
+        accountMasked,
+        proposal.symbol,
+        proposal.side,
+        decision.approvedQuantity,
+        orderType,
+        settlement.status ?? null,
+        now,
+        now,
+      );
+      // The proposal is no longer open for a second order the moment IBKR accepts this one.
+      this.db.prepare("UPDATE trade_proposals SET status = 'WORKING' WHERE id = ?").run(proposal.id);
+      const settled = this.#settleBrokerOrderRow(this.#brokerOrderRow(brokerOrderRowId), settlement, decision.status, now);
+      this.db.exec("COMMIT");
+      return {
+        proposal: this.getProposal(proposal.id),
+        riskEventId: resolvedRiskEventId,
+        brokerOrder: settled.brokerOrder,
+        order: settled.order,
+        trade: settled.trade,
+      };
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  // Reconciliation entry point: applies whatever IBKR now reports for an order that was
+  // still working, and is safe to call repeatedly because a booked row leaves WORKING.
+  settleBrokerOrder(id, settlement, resolvedStatus = "APPROVED") {
+    const now = new Date().toISOString();
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const row = this.#brokerOrderRow(id);
+      if (!row) throw new FinanceError("Broker order not found", { code: "BROKER_ORDER_NOT_FOUND", status: 404 });
+      if (row.status !== "WORKING") {
+        this.db.exec("COMMIT");
+        return { brokerOrder: mapBrokerOrder(row), order: this.getOrder(row.order_id), trade: null, changed: false };
+      }
+      const settled = this.#settleBrokerOrderRow(row, settlement, resolvedStatus, now);
+      this.db.exec("COMMIT");
+      return { ...settled, changed: true };
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  #settleBrokerOrderRow(row, settlement, resolvedStatus, now) {
+    const filledQuantity = Number(settlement.filledQuantity ?? 0);
+    const averageFillPrice = Number(settlement.averageFillPrice ?? 0);
+    const commission = settlement.commission == null ? null : Number(settlement.commission);
+    const brokerStatus = settlement.status ?? row.broker_status;
+    const executionIds = Array.isArray(settlement.executionIds) ? settlement.executionIds : [];
+    const terminal = TERMINAL_BROKER_STATUS.has(String(brokerStatus));
+    const priced = filledQuantity > 0 && averageFillPrice > 0 && commission != null && Number.isFinite(commission);
+    const complete = priced && (filledQuantity >= Number(row.quantity) || terminal);
+
+    if (!complete) {
+      const status = terminal && filledQuantity === 0 ? "CANCELLED" : "WORKING";
+      this.db.prepare(`
+        UPDATE broker_orders SET status = ?, broker_status = ?, filled_quantity = ?,
+          execution_ids_json = ?, updated_at = ? WHERE id = ?
+      `).run(status, brokerStatus, filledQuantity, JSON.stringify(executionIds), now, row.id);
+      if (status === "CANCELLED") {
+        this.db.prepare("UPDATE trade_proposals SET status = 'REJECTED', approved_quantity = 0, resolved_at = ? WHERE id = ?")
+          .run(now, row.proposal_id);
+      }
+      return { brokerOrder: mapBrokerOrder(this.#brokerOrderRow(row.id)), order: null, trade: null };
+    }
+
+    const priceCents = toCents(averageFillPrice);
+    const feeCents = toCents(Math.max(0, commission));
+    const proposal = this.getProposal(row.proposal_id);
+    this.#applyFillToLedger({
+      portfolioId: row.portfolio_id,
+      symbol: row.symbol,
+      side: row.side,
+      quantity: filledQuantity,
+      priceCents,
+      feeCents,
+      now,
+    });
+
+    const orderId = randomUUID();
+    const tradeId = randomUUID();
+    this.db.prepare(`
+      INSERT INTO orders (id, proposal_id, portfolio_id, agent_id, symbol, side, quantity, price_cents, fee_cents, status, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'FILLED', ?)
+    `).run(orderId, row.proposal_id, row.portfolio_id, row.agent_id, row.symbol, row.side, filledQuantity, priceCents, feeCents, now);
+    this.db.prepare(`
+      INSERT INTO trades (
+        id, order_id, portfolio_id, agent_id, strategy_id, experiment_id, decision_id,
+        symbol, side, quantity, price_cents, fee_cents, slippage_bps, evidence_manifest_id, executed_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      tradeId,
+      orderId,
+      row.portfolio_id,
+      row.agent_id,
+      proposal?.strategyId ?? null,
+      proposal?.experimentId ?? null,
+      proposal?.decisionId ?? row.proposal_id,
+      row.symbol,
+      row.side,
+      filledQuantity,
+      priceCents,
+      feeCents,
+      // A broker fill carries its own slippage inside the executed price; there is no
+      // simulated allowance to record.
+      0,
+      proposal?.evidenceManifestId ?? null,
+      now,
+    );
+    this.db.prepare(`
+      UPDATE broker_orders SET status = 'FILLED', broker_status = ?, filled_quantity = ?,
+        average_fill_price_cents = ?, fee_cents = ?, order_id = ?, execution_ids_json = ?, updated_at = ?
+      WHERE id = ?
+    `).run(brokerStatus, filledQuantity, priceCents, feeCents, orderId, JSON.stringify(executionIds), now, row.id);
+    this.db.prepare("UPDATE trade_proposals SET status = ?, approved_quantity = ?, resolved_at = ? WHERE id = ?")
+      .run(resolvedStatus, filledQuantity, now, row.proposal_id);
+    return {
+      brokerOrder: mapBrokerOrder(this.#brokerOrderRow(row.id)),
+      order: this.getOrder(orderId),
+      trade: this.getTrade(tradeId),
+    };
+  }
+
+  #brokerOrderRow(id) {
+    return this.db.prepare("SELECT * FROM broker_orders WHERE id = ?").get(id);
+  }
+
+  getBrokerOrder(id) {
+    const row = this.#brokerOrderRow(id);
+    return row ? mapBrokerOrder(row) : null;
+  }
+
+  listBrokerOrders({ portfolioId, agentId, status, limit = 100 } = {}) {
+    const filters = [];
+    const values = [];
+    if (portfolioId) { filters.push("portfolio_id = ?"); values.push(portfolioId); }
+    if (agentId) { filters.push("agent_id = ?"); values.push(agentId); }
+    if (status) { filters.push("status = ?"); values.push(status); }
+    const where = filters.length ? `WHERE ${filters.join(" AND ")}` : "";
+    return this.db.prepare(
+      `SELECT * FROM broker_orders ${where} ORDER BY created_at DESC LIMIT ?`,
+    ).all(...values, limit).map(mapBrokerOrder);
+  }
+
+  listWorkingBrokerOrders({ portfolioId, limit = 100 } = {}) {
+    return this.listBrokerOrders({ portfolioId, status: "WORKING", limit })
+      .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+  }
+
+  hasInFlightBrokerOrder(portfolioId) {
+    return Boolean(this.db.prepare(`
+      SELECT 1 FROM broker_orders WHERE portfolio_id = ? AND status = 'WORKING'
+      UNION ALL SELECT 1 FROM trade_proposals WHERE portfolio_id = ? AND status = 'SUBMITTING'
+      LIMIT 1
+    `).get(portfolioId, portfolioId));
+  }
+
+  upgradeBrokerOrderIdentity(id, brokerOrderId) {
+    this.db.prepare(`
+      UPDATE broker_orders SET broker_order_id = ?, updated_at = ?
+      WHERE id = ? AND status = 'WORKING'
+    `).run(brokerOrderId, new Date().toISOString(), id);
+    return this.getBrokerOrder(id);
   }
 
   getOrder(id) {
@@ -682,10 +1112,11 @@ export class FinanceStore {
     this.db.exec("BEGIN IMMEDIATE");
     try {
       this.db.prepare("INSERT INTO finance_teams (id, name, created_at) VALUES (?, ?, ?)").run(id, name, createdAt);
+      this.#attachTeamPortfolio(id, name);
       const insertMember = this.db.prepare(`
-        INSERT INTO finance_team_members (team_id, agent_id, assigned_at) VALUES (?, ?, ?)
+        INSERT INTO finance_team_members (team_id, agent_id, assigned_at, team_rank) VALUES (?, ?, ?, ?)
       `);
-      for (const agentId of agentIds) insertMember.run(id, agentId, createdAt);
+      agentIds.forEach((agentId, index) => insertMember.run(id, agentId, createdAt, index + 1));
       this.db.exec("COMMIT");
       return this.getFinanceTeam(id);
     } catch (error) {
@@ -705,16 +1136,118 @@ export class FinanceStore {
     return teams.map((team) => mapFinanceTeam(team, this.listFinanceTeamMembers(team.id)));
   }
 
+  getFinanceTeamByPortfolio(portfolioId) {
+    const row = this.db.prepare("SELECT * FROM finance_teams WHERE portfolio_id = ?").get(portfolioId);
+    return row ? mapFinanceTeam(row, this.listFinanceTeamMembers(row.id)) : null;
+  }
+
   removeFinanceTeam(id) {
-    return this.db.prepare("DELETE FROM finance_teams WHERE id = ?").run(id).changes > 0;
+    const team = this.db.prepare("SELECT portfolio_id FROM finance_teams WHERE id = ?").get(id);
+    if (!team) return false;
+    const unresolved = this.db.prepare(`
+      SELECT 1 FROM trade_proposals
+      WHERE portfolio_id = ? AND status IN ('PROPOSED', 'LEAD_APPROVED', 'SUBMITTING', 'WORKING')
+      UNION ALL SELECT 1 FROM broker_orders WHERE portfolio_id = ? AND status = 'WORKING'
+      LIMIT 1
+    `).get(team.portfolio_id, team.portfolio_id);
+    if (unresolved) {
+      throw new FinanceError("Finance team has an unresolved order workflow", {
+        code: "FINANCE_TEAM_ORDER_IN_FLIGHT",
+        status: 409,
+      });
+    }
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db.prepare("DELETE FROM finance_teams WHERE id = ?").run(id);
+      // A team portfolio without ledger history is scratch state; keep it only when
+      // proposals, trades, or experiments still reference it for audit purposes.
+      if (team.portfolio_id && !this.#portfolioHasLedger(team.portfolio_id)) {
+        this.db.prepare("DELETE FROM portfolios WHERE id = ?").run(team.portfolio_id);
+      }
+      this.db.exec("COMMIT");
+      return true;
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  #portfolioHasLedger(portfolioId) {
+    return Boolean(this.db.prepare(`
+      SELECT 1 FROM trade_proposals WHERE portfolio_id = ?
+      UNION ALL SELECT 1 FROM trades WHERE portfolio_id = ?
+      UNION ALL SELECT 1 FROM experiments WHERE portfolio_id = ?
+      LIMIT 1
+    `).get(portfolioId, portfolioId, portfolioId));
+  }
+
+  addFinanceTeamMembers(teamId, agentIds) {
+    const assignedAt = new Date().toISOString();
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const insertMember = this.db.prepare(`
+        INSERT OR IGNORE INTO finance_team_members (team_id, agent_id, assigned_at, team_rank) VALUES (?, ?, ?, ?)
+      `);
+      for (const agentId of agentIds) insertMember.run(teamId, agentId, assignedAt, 0);
+      this.#recompactTeamRanks(teamId);
+      this.db.exec("COMMIT");
+      return this.getFinanceTeam(teamId);
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  removeFinanceTeamMember(teamId, agentId) {
+    const previousLead = this.#orderedTeamMemberIds(teamId)[0];
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const removed = this.db.prepare(
+        "DELETE FROM finance_team_members WHERE team_id = ? AND agent_id = ?",
+      ).run(teamId, agentId).changes > 0;
+      if (removed) {
+        this.#recompactTeamRanks(teamId);
+        if (previousLead === agentId) this.#invalidateTeamApprovals(teamId);
+      }
+      this.db.exec("COMMIT");
+      return removed;
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  setFinanceTeamLead(teamId, agentId) {
+    const ordered = this.#orderedTeamMemberIds(teamId);
+    if (!ordered.includes(agentId)) return null;
+    const leadChanged = ordered[0] !== agentId;
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.#writeTeamRanks(teamId, [agentId, ...ordered.filter((member) => member !== agentId)]);
+      if (leadChanged) this.#invalidateTeamApprovals(teamId);
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+    return this.getFinanceTeam(teamId);
+  }
+
+  #invalidateTeamApprovals(teamId) {
+    this.db.prepare(`
+      UPDATE trade_proposals
+      SET status = 'PROPOSED', lead_approved_by_agent_id = NULL, lead_approved_at = NULL
+      WHERE portfolio_id = (SELECT portfolio_id FROM finance_teams WHERE id = ?)
+        AND status = 'LEAD_APPROVED'
+    `).run(teamId);
   }
 
   listFinanceTeamMembers(teamId) {
     return this.db.prepare(`
-      SELECT a.* FROM finance_team_members m
+      SELECT a.*, m.team_rank FROM finance_team_members m
       JOIN finance_agents a ON a.agent_id = m.agent_id
-      WHERE m.team_id = ? ORDER BY m.assigned_at, a.agent_id
-    `).all(teamId).map(mapFinanceAgent);
+      WHERE m.team_id = ? ORDER BY m.team_rank, m.assigned_at, a.agent_id
+    `).all(teamId).map(mapFinanceTeamMember);
   }
 
   listDuePredictions(at = new Date().toISOString()) {
@@ -947,6 +1480,8 @@ function mapProposal(row) {
     evidenceManifestId: row.evidence_manifest_id,
     status: row.status,
     approvedQuantity: row.approved_quantity === null ? null : Number(row.approved_quantity),
+    leadApprovedByAgentId: row.lead_approved_by_agent_id ?? null,
+    leadApprovedAt: row.lead_approved_at ?? null,
     createdAt: row.created_at,
     resolvedAt: row.resolved_at,
   };
@@ -965,6 +1500,32 @@ function mapOrder(row) {
     fee: fromCents(row.fee_cents),
     status: row.status,
     createdAt: row.created_at,
+  };
+}
+
+function mapBrokerOrder(row) {
+  return {
+    id: row.id,
+    proposalId: row.proposal_id,
+    portfolioId: row.portfolio_id,
+    agentId: row.agent_id,
+    broker: row.broker,
+    brokerOrderId: row.broker_order_id,
+    clientOrderId: row.client_order_id == null ? null : Number(row.client_order_id),
+    accountMasked: row.account_masked,
+    symbol: row.symbol,
+    side: row.side,
+    quantity: Number(row.quantity),
+    orderType: row.order_type,
+    status: row.status,
+    brokerStatus: row.broker_status,
+    filledQuantity: Number(row.filled_quantity),
+    averageFillPrice: row.average_fill_price_cents == null ? null : fromCents(row.average_fill_price_cents),
+    fee: row.fee_cents == null ? null : fromCents(row.fee_cents),
+    orderId: row.order_id,
+    executionIds: JSON.parse(row.execution_ids_json),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
   };
 }
 
@@ -1048,10 +1609,16 @@ function mapFinanceAgent(row) {
   };
 }
 
+function mapFinanceTeamMember(row) {
+  return { ...mapFinanceAgent(row), rank: Number(row.team_rank), lead: Number(row.team_rank) === 1 };
+}
+
 function mapFinanceTeam(row, members) {
   return {
     id: row.id,
     name: row.name,
+    portfolioId: row.portfolio_id ?? null,
+    leadAgentId: members.find((member) => member.lead)?.agentId ?? null,
     members,
     createdAt: row.created_at,
   };

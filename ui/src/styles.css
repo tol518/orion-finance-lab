@@ -291,6 +291,12 @@ button:disabled {
   padding: 14px;
 }
 
+.portfolio-order-block {
+  display: grid;
+  gap: 8px;
+  margin: 14px 0;
+}
+
 .text-button {
   display: inline-flex;
   flex: 0 0 auto;
@@ -1285,6 +1291,12 @@ textarea:focus {
   gap: 12px;
 }
 
+.team-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
 .team-members {
   display: flex;
   flex-wrap: wrap;
@@ -1292,13 +1304,162 @@ textarea:focus {
   margin-top: 10px;
 }
 
-.team-members span {
+.member-chip {
   border: 1px solid color-mix(in srgb, var(--cyan) 22%, transparent);
   border-radius: 4px;
   background: color-mix(in srgb, var(--cyan) 7%, transparent);
   color: var(--text);
   font-size: 10px;
   padding: 3px 6px;
+}
+
+.dry-run-notice {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  border: 1px solid color-mix(in srgb, var(--cyan) 40%, var(--border));
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--cyan) 8%, transparent);
+  padding: 12px 14px;
+}
+
+.dry-run-notice div {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.dry-run-notice strong {
+  color: var(--text-strong);
+  font-size: 13px;
+}
+
+.dry-run-notice small {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.team-roster {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  list-style: none;
+  margin: 0 0 14px;
+  padding: 0;
+}
+
+.team-roster li {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 7px 10px;
+}
+
+.team-roster li.lead {
+  border-color: color-mix(in srgb, var(--cyan) 40%, var(--border));
+  background: color-mix(in srgb, var(--cyan) 6%, transparent);
+}
+
+.team-roster li div {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  flex: 1;
+}
+
+.team-roster li strong {
+  color: var(--text-strong);
+  font-size: 12px;
+}
+
+.team-roster li small {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.roster-rank {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--cyan) 12%, transparent);
+  color: var(--text);
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.lead-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--cyan);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.team-member.lead {
+  border-color: color-mix(in srgb, var(--cyan) 45%, transparent);
+  background: color-mix(in srgb, var(--cyan) 14%, transparent);
+}
+
+.portfolio-total {
+  color: var(--text-strong);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.team-member {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border: 1px solid color-mix(in srgb, var(--cyan) 22%, transparent);
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--cyan) 7%, transparent);
+  color: var(--text);
+  cursor: pointer;
+  font-size: 10px;
+  padding: 3px 6px;
+}
+
+.team-member svg {
+  width: 0;
+  opacity: 0;
+  transition: width 120ms ease, opacity 120ms ease;
+}
+
+.team-member:hover,
+.team-member:focus-visible {
+  border-color: color-mix(in srgb, var(--danger) 55%, var(--border));
+  color: var(--text-strong);
+}
+
+.team-member:hover svg,
+.team-member:focus-visible svg {
+  width: 11px;
+  opacity: 1;
+}
+
+.confirmation-modal {
+  width: min(420px, calc(100vw - 30px));
+}
+
+.confirmation-modal p {
+  margin: 0;
+  color: var(--text);
+  line-height: 1.55;
+}
+
+.confirmation-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 20px;
 }
 
 .team-modal {

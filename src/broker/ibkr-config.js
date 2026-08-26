@@ -1,5 +1,18 @@
 import { IbkrGatewayClient } from "./ibkr-gateway-client.js";
 
+export const IBKR_EXECUTION_MODES = Object.freeze(["off", "dry-run", "live"]);
+
+// Broker execution stays off unless an operator opts in. `dry-run` sends IBKR whatIf
+// previews only: the order is validated and margin-checked by IBKR but never placed.
+// `live` transmits a real paper order and books the broker's own fill on the ledger.
+export function resolveIbkrExecutionMode(env = process.env) {
+  const mode = env.FINANCE_IBKR_EXECUTION ?? "off";
+  if (!IBKR_EXECUTION_MODES.includes(mode)) {
+    throw new Error(`FINANCE_IBKR_EXECUTION must be one of ${IBKR_EXECUTION_MODES.join(", ")}`);
+  }
+  return mode;
+}
+
 export function createIbkrBrokerFromEnv(env = process.env) {
   const mode = env.FINANCE_BROKER_MODE ?? "local";
   if (mode === "local") return null;

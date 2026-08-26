@@ -3,7 +3,7 @@ import { fileURLToPath } from "node:url";
 import { FinanceLabService } from "../service/finance-lab.js";
 import { createFinanceRouter } from "../api/router.js";
 import { listenFinanceService } from "../api/service-app.js";
-import { createIbkrBrokerFromEnv } from "../broker/ibkr-config.js";
+import { createIbkrBrokerFromEnv, resolveIbkrExecutionMode } from "../broker/ibkr-config.js";
 
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 let financeLab;
@@ -21,6 +21,7 @@ const plugin = {
       dataDir: context.dataDir,
       logger: context.logger,
       broker,
+      ibkrExecution: resolveIbkrExecutionMode(),
       riskPolicy: parseJsonEnv("FINANCE_RISK_POLICY_JSON"),
       tradingAgents: {
         repoPath: process.env.FINANCE_TRADINGAGENTS_REPO,

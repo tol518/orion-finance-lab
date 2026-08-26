@@ -40,10 +40,14 @@ const TOOL_NAMES = [
   "finance_get_market_context",
   "finance_run_quant_analysis",
   "finance_run_strategy",
+  "finance_get_team",
   "finance_get_portfolio",
   "finance_get_trade_history",
+  "finance_get_trade_proposals",
   "finance_create_trade_proposal",
+  "finance_approve_trade_proposal",
   "finance_execute_paper_trade",
+  "finance_settle_broker_orders",
   "finance_record_prediction",
   "finance_get_prediction_results",
   "finance_get_agent_performance",
@@ -101,12 +105,17 @@ function createTools(client, permissions) {
     }), (params, signal) => client.request("/quant/run", { method: "POST", body: params, signal })),
     tool("finance_run_strategy", "Run a registered Finance Lab strategy and persist its evidence manifest.", "strategy.run", StrategyInput,
       ({ strategyId, ...body }, signal) => client.request(`/strategies/${encodeURIComponent(strategyId)}/run`, { method: "POST", body, signal })),
+    tool("finance_get_team", "Read your finance team: your role, your rank, who leads the team, your teammates, and the team paper portfolio your decisions belong to.", "portfolio.read", Type.Object({}),
+      (_params, signal) => client.request("/finance-teams/context", { signal })),
     tool("finance_get_portfolio", "Inspect a paper portfolio, positions, valuation, and risk-adjusted statistics.", "portfolio.read", Type.Object({
       portfolioId: Type.Optional(Type.String({ maxLength: 128 })),
     }), (params, signal) => client.request(`/portfolios/${encodeURIComponent(params.portfolioId ?? "paper-main")}`, { signal })),
     tool("finance_get_trade_history", "Inspect immutable paper trade history.", "portfolio.read", Type.Object({
       portfolioId: Type.Optional(Type.String({ maxLength: 128 })), limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 500 })),
     }), (params, signal) => client.request(`/trades?${query(params, ["portfolioId", "limit"])}`, { signal })),
+    tool("finance_get_trade_proposals", "Inspect your proposals, or all team proposals when you are the team lead.", "portfolio.read", Type.Object({
+      portfolioId: Type.Optional(Type.String({ maxLength: 128 })), limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 500 })),
+    }), (params, signal) => client.request(`/proposals?${query(params, ["portfolioId", "limit"])}`, { signal })),
     tool("finance_create_trade_proposal", "Create a paper-trade proposal. This never bypasses deterministic risk review.", "trade.propose", Type.Object({
       portfolioId: Type.Optional(Type.String({ maxLength: 128 })),
       strategyId: Type.Optional(Type.String({ maxLength: 128 })),
@@ -115,9 +124,14 @@ function createTools(client, permissions) {
       quantity: Type.Number({ exclusiveMinimum: 0 }),
       thesis: Type.Optional(Type.String({ maxLength: 20000 })),
     }), (params, signal) => client.request("/proposals", { method: "POST", body: params, signal })),
-    tool("finance_execute_paper_trade", "Submit one existing proposal to deterministic risk checks and the paper broker.", "trade.execute", Type.Object({
+    tool("finance_approve_trade_proposal", "Approve a trader's team proposal as the current rank-1 team lead.", "trade.execute", Type.Object({
+      proposalId: Type.String({ minLength: 1, maxLength: 128 }),
+    }), (params, signal) => client.request(`/proposals/${encodeURIComponent(params.proposalId)}/approve`, { method: "POST", signal })),
+    tool("finance_execute_paper_trade", "Submit your team-lead-approved trader proposal to deterministic risk checks and the paper broker.", "trade.execute", Type.Object({
       proposalId: Type.String({ minLength: 1, maxLength: 128 }),
     }), (params, signal) => client.request(`/proposals/${encodeURIComponent(params.proposalId)}/execute`, { method: "POST", signal })),
+    tool("finance_settle_broker_orders", "Settle your team's broker orders that are still working at IBKR, booking any completed fill onto your team book.", "trade.execute", Type.Object({}),
+      (_params, signal) => client.request("/broker/reconcile", { method: "POST", body: {}, signal })),
     tool("finance_record_prediction", "Append a timestamped investment prediction without requiring a trade.", "prediction.write", Type.Object({
       strategyId: Type.Optional(Type.String({ maxLength: 128 })),
       experimentId: Type.Optional(Type.String({ maxLength: 128 })),

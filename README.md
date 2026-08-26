@@ -10,7 +10,7 @@ Finance Lab does **not** create, register, persist, or orchestrate agents. Agent
 
 This repository is the sanitized public version of the Finance Lab used in the owner's private ORION workflow. It contains the implementation behind the dashboard, agent tools, strategy and risk pipeline, paper broker, persistence, and IBKR adapter, but it does not contain the owner's credentials, account identifiers, agent records, database, logs, local paths, or runtime configuration.
 
-In the private workflow, IB Gateway Paper Trading is connected to Finance Lab and the owner's ORION agents. The agents can read current paper-account balances and positions, run research, record predictions, and prepare trade proposals. Finance Lab does not yet submit those proposals to Interactive Brokers. IBKR order placement, fills, cancellation, and commission reconciliation remain deliberately locked until that execution path is implemented and verified.
+In the private workflow, IB Gateway Paper Trading is connected to Finance Lab and the owner's ORION agents. Agents can read paper-account balances and positions, run research, record predictions, and use a two-person order workflow: a team trader proposes, the current team lead approves, and that same trader submits. Live paper submission remains disabled unless the operator explicitly selects `FINANCE_IBKR_EXECUTION=live`; account identifiers and credentials are not included in this repository.
 
 ## Project goal
 
@@ -171,7 +171,7 @@ Make `FINANCE_SERVICE_TOKEN` and `FINANCE_AGENT_SIGNING_KEY` available to the Op
 }
 ```
 
-`trade.execute` is excluded by default. In local mode it submits an existing proposal to deterministic risk and the local paper broker. In IBKR read-only mode it returns `IBKR_READ_ONLY`; no broker order is sent. OpenClaw tool allowlists remain an additional gate because every Finance Lab tool is registered as optional.
+`trade.execute` is excluded by default. For team portfolios it is still split by identity: the current rank-1 lead approves a non-lead trader's proposal, then that same trader submits it. In IBKR read-only mode submission returns `IBKR_READ_ONLY`; no broker order is sent. OpenClaw tool allowlists remain an additional gate because every Finance Lab tool is registered as optional.
 
 Restart the OpenClaw gateway after installing or changing plugin configuration. Confirm the plugin and runtime state with:
 
@@ -216,7 +216,7 @@ The Finance Room is loaded dynamically through ORION's generic plugin runtime. I
 | --- | --- |
 | Overview | Portfolio metrics, allocation, positions, decisions, research, risk, experiments, and agent coverage. |
 | Portfolio | Current valuation, cash, exposure, position P&L, drawdown, Sharpe, and Sortino. |
-| Trades | Proposal ledger, explicit risk-check action, and immutable paper executions. |
+| Trades | Cross-team proposal history, IBKR broker-order lifecycle, and immutable filled paper executions. |
 | Predictions | Append a prediction and inspect pending or evaluated outcomes. |
 | Agents | Assign existing ORION agents to Finance Lab and create up to five teams with one to five assigned agents each. Teams work below the maximum size. Finance Lab does not create agents. |
 | Strategies | Run and compare quant, momentum, value, and optional TradingAgents strategies. |
@@ -273,14 +273,15 @@ Predictions and evidence manifests have SQLite triggers that reject updates and 
 
 ## Current limits
 
-- IBKR paper balances and positions are connected, but broker order submission and fill management are not implemented yet.
+- IBKR paper submission and fill reconciliation are implemented, but execution remains off unless `FINANCE_IBKR_EXECUTION` is explicitly set to `dry-run` or `live`.
+- Live proposals are claimed as `SUBMITTING` before transmission and carry the proposal ID as IBKR `orderRef`. Reconciliation uses that reference to recover an accepted order after a timeout or process interruption without resubmitting it.
 - Yahoo Finance is the included market-data adapter; production use may require a licensed provider.
 - TradingAgents is optional and must be installed and configured separately.
 
 ## Security
 
 - Keep both Finance bridge secrets, provider credentials, model keys, account identifiers, and local paths out of Git.
-- The agent bridge rejects non-loopback binding. Keep ORION itself behind its authenticated local boundary.
+- The agent bridge accepts loopback and Docker Desktop's `host.docker.internal` bridge only. Keep ORION itself behind its authenticated local boundary.
 - Do not grant `trade.execute` through broad defaults.
 - Keep `FINANCE_IBKR_HOST` on loopback, use a dedicated client ID, and require an explicit paper-account ID. Never configure a live account ID.
 - The bearer token authenticates the bridge client. A separate key signs short-lived agent identity and permission assertions, and the bridge rejects missing, expired, replayed, or invalid assertions.

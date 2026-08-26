@@ -51,6 +51,7 @@ export type Portfolio = {
 export type Trade = {
   id: string;
   decisionId: string;
+  portfolioId: string;
   agentId: string;
   strategyId: string | null;
   symbol: string;
@@ -64,15 +65,42 @@ export type Trade = {
 export type Proposal = {
   id: string;
   decisionId: string;
+  portfolioId: string;
   agentId: string;
   strategyId: string | null;
   symbol: string;
   side: "BUY" | "SELL";
   requestedQuantity: number;
   approvedQuantity: number | null;
+  leadApprovedByAgentId: string | null;
+  leadApprovedAt: string | null;
   status: string;
   thesis: string | null;
   createdAt: string;
+};
+
+export type BrokerOrder = {
+  id: string;
+  proposalId: string;
+  portfolioId: string;
+  agentId: string;
+  broker: "ibkr";
+  brokerOrderId: string | null;
+  clientOrderId: number | null;
+  accountMasked: string;
+  symbol: string;
+  side: "BUY" | "SELL";
+  quantity: number;
+  orderType: string;
+  status: "WORKING" | "FILLED" | "CANCELLED";
+  brokerStatus: string | null;
+  filledQuantity: number;
+  averageFillPrice: number | null;
+  fee: number | null;
+  orderId: string | null;
+  executionIds: string[];
+  createdAt: string;
+  updatedAt: string;
 };
 
 export type Prediction = {
@@ -129,11 +157,45 @@ export type FinanceAgent = {
   assignedAt: string;
 };
 
+export type FinanceTeamMember = FinanceAgent & {
+  rank: number;
+  lead: boolean;
+};
+
 export type FinanceTeam = {
   id: string;
   name: string;
-  members: FinanceAgent[];
+  portfolioId: string | null;
+  leadAgentId: string | null;
+  members: FinanceTeamMember[];
   createdAt: string;
+};
+
+export type TeamPortfolio = {
+  teamId: string;
+  teamName: string;
+  leadAgentId: string | null;
+  members: FinanceTeamMember[];
+  createdAt: string;
+  portfolio: Portfolio;
+};
+
+export type TeamPortfolioTotal = {
+  portfolioCount: number;
+  currency: string;
+  cash: number;
+  initialCash: number;
+  totalValue: number;
+  grossExposure: number;
+  dailyPnl: number;
+  dailyReturn: number;
+  totalReturn: number | null;
+  positions: Position[];
+};
+
+export type TeamPortfolios = {
+  teams: TeamPortfolio[];
+  total: TeamPortfolioTotal;
 };
 
 export type Strategy = {
@@ -184,18 +246,69 @@ export type RiskState = {
 };
 
 export type Overview = {
-  mode: "paper" | "ibkr-paper-read-only";
+  mode: "paper" | "ibkr-paper-read-only" | "ibkr-paper-dry-run" | "ibkr-paper-live";
   generatedAt: string;
   portfolio: Portfolio;
   risk: RiskState;
   recentTrades: Trade[];
   recentProposals: Proposal[];
+  recentBrokerOrders: BrokerOrder[];
   recentPredictions: Prediction[];
   experiments: Experiment[];
   agents: AgentPerformance[];
   financeAgents: FinanceAgent[];
   financeTeams: FinanceTeam[];
+  teamPortfolios: TeamPortfolios;
   strategies: Strategy[];
+};
+
+export type OrderPreview = {
+  mode: "dry-run";
+  broker: "ibkr";
+  decision: {
+    status: string;
+    approvedQuantity: number;
+    reasons: string[];
+  };
+  preview: null | {
+    accountIdMasked: string;
+    orderId: number | null;
+    whatIf: boolean;
+    status: string | null;
+    symbol: string;
+    side: string;
+    quantity: number;
+    orderType: string;
+    preview: null | {
+      status: string;
+      initMarginChange: number | null;
+      maintMarginChange: number | null;
+      commissionAndFees: number | null;
+      commissionAndFeesCurrency: string;
+      warningText: string;
+      rejectReason: string;
+    };
+  };
+};
+
+export type LiveOrderResult = {
+  mode: "live";
+  broker: "ibkr";
+  decision: {
+    status: string;
+    approvedQuantity: number;
+    reasons: string[];
+  };
+  brokerOrder: BrokerOrder | null;
+  trade: Trade | null;
+};
+
+export type ReconcileReport = {
+  broker: "ibkr";
+  checked: number;
+  settled: LiveOrderResult["brokerOrder"][];
+  stillWorking: LiveOrderResult["brokerOrder"][];
+  retrievedAt?: string;
 };
 
 export type StrategyRun = {

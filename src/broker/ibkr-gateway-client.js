@@ -65,6 +65,101 @@ export class IbkrGatewayClient {
     return normalizeSnapshot(result, probe);
   }
 
+  // Orders always re-resolve the account allowlist first: an order must never inherit an
+  // account from Gateway state, and a paper account swap has to fail closed.
+  async placeOrder({ symbol, side, quantity, orderType = "MKT", limitPrice = null, whatIf = true, orderRef = null }) {
+    const probe = await this.probe();
+    const accountId = probe.selectedAccount;
+    if (!accountId) {
+      throw new FinanceError("IBKR paper account allowlist is not configured", {
+        code: "IBKR_ACCOUNT_NOT_CONFIGURED",
+        status: 503,
+      });
+    }
+    const result = await this.#request("place_order", {
+      accountId,
+      symbol,
+      side,
+      quantity,
+      orderType,
+      limitPrice,
+      whatIf,
+      orderRef,
+    });
+    if (cleanAccountId(result.accountId) !== accountId) {
+      throw new FinanceError("IBKR returned an unexpected account", {
+        code: "IBKR_ACCOUNT_MISMATCH",
+        status: 503,
+      });
+    }
+    // A resting order may emit openOrder before orderStatus. Either callback proves IBKR
+    // accepted it; requiring a fill object misclassifies working orders as rejections.
+    const acknowledged = whatIf ? Boolean(result.preview) : Boolean(result.fill || result.preview);
+    if (!acknowledged) {
+      const rejection = Array.isArray(result.errors) ? result.errors[0] : null;
+      throw new FinanceError(rejection?.message ?? "IBKR did not acknowledge the order", {
+        code: "IBKR_ORDER_REJECTED",
+        status: 502,
+        details: { ibkrCode: rejection?.code ?? null, orderId: result.orderId ?? null },
+      });
+    }
+    const executions = Array.isArray(result.executions) ? result.executions : [];
+    return {
+      accountIdMasked: maskAccountId(accountId),
+      orderId: result.orderId ?? null,
+      whatIf: result.whatIf === true,
+      status: result.status ?? null,
+      symbol: result.symbol ?? symbol,
+      side: result.side ?? side,
+      quantity: Number(result.quantity ?? quantity),
+      orderType: result.orderType ?? orderType,
+      contract: result.contract ?? null,
+      preview: result.preview ?? null,
+      fill: result.fill ?? null,
+      executions,
+      // A live order settles as either a fill or a working order; the ledger needs the
+      // difference, and permId is the id that survives an API session restart.
+      settlement: result.whatIf === true ? null : normalizeSettlement(result, executions),
+    };
+  }
+
+  // Re-reads what IBKR still holds open and every execution it has for the account, so an
+  // order that filled after the placing call returned can still be settled exactly once.
+  async reconcile() {
+    const probe = await this.probe();
+    const accountId = probe.selectedAccount;
+    if (!accountId) {
+      throw new FinanceError("IBKR paper account allowlist is not configured", {
+        code: "IBKR_ACCOUNT_NOT_CONFIGURED",
+        status: 503,
+      });
+    }
+    const result = await this.#request("reconcile", { accountId });
+    if (cleanAccountId(result.accountId) !== accountId) {
+      throw new FinanceError("IBKR returned an unexpected account", {
+        code: "IBKR_ACCOUNT_MISMATCH",
+        status: 503,
+      });
+    }
+    const executions = Array.isArray(result.executions) ? result.executions : [];
+    const normalizeOrder = (order) => ({
+      brokerOrderId: brokerOrderId(order),
+      symbol: order.symbol ?? null,
+      side: order.side ?? null,
+      quantity: Number(order.quantity ?? 0),
+      status: order.status ?? null,
+      orderRef: order.orderRef || null,
+      clientOrderId: Number(order.orderId ?? 0) || null,
+    });
+    return {
+      accountIdMasked: maskAccountId(accountId),
+      openOrders: (Array.isArray(result.openOrders) ? result.openOrders : []).map(normalizeOrder),
+      completedOrders: (Array.isArray(result.completedOrders) ? result.completedOrders : []).map(normalizeOrder),
+      executionsByBrokerOrderId: groupExecutions(executions),
+      retrievedAt: new Date().toISOString(),
+    };
+  }
+
   #request(operation, extra = {}) {
     const pending = this.queue.then(
       () => this.#performRequest(operation, extra),
@@ -152,6 +247,79 @@ function runPythonBridge({ python, bridgePath, timeoutMs, request }) {
       callback(value);
     }
   });
+}
+
+// permId is stable across API sessions; the per-session orderId is only a fallback for a
+// Gateway that has not assigned one yet, and is namespaced so the two can never collide.
+function brokerOrderId(source) {
+  const permId = Number(source?.permId ?? 0);
+  if (Number.isSafeInteger(permId) && permId > 0) return String(permId);
+  const orderId = Number(source?.orderId ?? 0);
+  return Number.isSafeInteger(orderId) && orderId > 0 ? `client:${orderId}` : null;
+}
+
+function normalizeSettlement(result, executions) {
+  const fill = result.fill ?? null;
+  const filledQuantity = Number(fill?.filled ?? 0);
+  const grouped = groupExecutions(executions);
+  const id = brokerOrderId({ permId: fill?.permId ?? result.permId, orderId: result.orderId });
+  return {
+    brokerOrderId: id,
+    clientOrderId: Number(result.orderId ?? 0) || null,
+    status: String(fill?.status ?? result.status ?? "UNKNOWN"),
+    filledQuantity,
+    remainingQuantity: Number(fill?.remaining ?? 0),
+    averageFillPrice: positiveOrNull(fill?.averageFillPrice),
+    // IBKR reports commission per execution; an order with no execution yet has no fee.
+    commission: totalCommission(id ? grouped[id]?.executions ?? executions : executions, filledQuantity),
+    executionIds: executions.map((item) => String(item.executionId)).filter(Boolean),
+  };
+}
+
+function groupExecutions(executions) {
+  const grouped = {};
+  for (const execution of executions) {
+    const id = brokerOrderId(execution);
+    if (!id) continue;
+    const bucket = (grouped[id] ??= { executions: [], filledQuantity: 0, notional: 0 });
+    bucket.orderRef ??= execution.orderRef || null;
+    bucket.executions.push(execution);
+    const quantity = Number(execution.quantity ?? 0);
+    const price = Number(execution.price ?? 0);
+    if (quantity > 0 && price > 0) {
+      bucket.filledQuantity += quantity;
+      bucket.notional += quantity * price;
+    }
+  }
+  for (const bucket of Object.values(grouped)) {
+    bucket.averageFillPrice = bucket.filledQuantity > 0 ? bucket.notional / bucket.filledQuantity : null;
+    bucket.commission = totalCommission(bucket.executions);
+  }
+  return grouped;
+}
+
+// A missing commission report is not a zero fee: the ledger must know the difference so it
+// does not book a free trade for a fill whose cost has not arrived yet.
+function totalCommission(executions, expectedQuantity = null) {
+  if (executions.length === 0) return null;
+  let total = 0;
+  for (const execution of executions) {
+    const rawValue = execution?.commission?.commission;
+    if (rawValue == null) return null;
+    const value = Number(rawValue);
+    if (!Number.isFinite(value)) return null;
+    total += value;
+  }
+  if (expectedQuantity != null) {
+    const executionQuantity = executions.reduce((sum, execution) => sum + Number(execution.quantity ?? 0), 0);
+    if (executionQuantity + 1e-9 < expectedQuantity) return null;
+  }
+  return total;
+}
+
+function positiveOrNull(value) {
+  const number = Number(value);
+  return Number.isFinite(number) && number > 0 ? number : null;
 }
 
 function normalizeSnapshot(result, probe) {

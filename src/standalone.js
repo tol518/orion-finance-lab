@@ -3,7 +3,7 @@ import { fileURLToPath } from "node:url";
 import dotenv from "dotenv";
 import { FinanceLabService } from "./service/finance-lab.js";
 import { listenFinanceService } from "./api/service-app.js";
-import { createIbkrBrokerFromEnv } from "./broker/ibkr-config.js";
+import { createIbkrBrokerFromEnv, resolveIbkrExecutionMode } from "./broker/ibkr-config.js";
 
 dotenv.config();
 
@@ -16,6 +16,7 @@ const signingKey = process.env.FINANCE_AGENT_SIGNING_KEY ?? "";
 const service = new FinanceLabService({
   dataDir: path.resolve(rootDir, process.env.FINANCE_DATA_DIR ?? "data"),
   broker: createIbkrBrokerFromEnv(),
+  ibkrExecution: resolveIbkrExecutionMode(),
   riskPolicy: parseJsonEnv("FINANCE_RISK_POLICY_JSON"),
   tradingAgents: {
     repoPath: process.env.FINANCE_TRADINGAGENTS_REPO,

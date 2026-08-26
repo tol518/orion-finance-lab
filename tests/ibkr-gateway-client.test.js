@@ -85,6 +85,74 @@ test("IBKR requests sharing a client ID are serialized", async () => {
   assert.equal(maximumActive, 1);
 });
 
+test("IBKR client accepts a live order acknowledged by openOrder before orderStatus", async () => {
+  const client = new IbkrGatewayClient({
+    accountId: "TEST-PAPER-ACCOUNT",
+    runBridge: async ({ request }) => {
+      if (request.operation === "probe") {
+        return { connected: true, accounts: ["TEST-PAPER-ACCOUNT"] };
+      }
+      return {
+        accountId: "TEST-PAPER-ACCOUNT",
+        orderId: 5,
+        permId: 1450009528,
+        whatIf: false,
+        status: "PreSubmitted",
+        preview: { status: "PreSubmitted", warningText: "" },
+        fill: null,
+        executions: [],
+        errors: [{ code: 399, message: "Order Message: Warning: held until market open" }],
+      };
+    },
+  });
+
+  const placed = await client.placeOrder({ symbol: "AAPL", side: "BUY", quantity: 1, whatIf: false });
+  assert.equal(placed.orderId, 5);
+  assert.equal(placed.settlement.brokerOrderId, "1450009528");
+  assert.equal(placed.settlement.status, "PreSubmitted");
+  assert.equal(placed.settlement.filledQuantity, 0);
+});
+
+test("IBKR reconciliation waits for every execution commission", async () => {
+  const client = new IbkrGatewayClient({
+    accountId: "TEST-PAPER-ACCOUNT",
+    runBridge: async ({ request }) => request.operation === "probe"
+      ? { connected: true, accounts: ["TEST-PAPER-ACCOUNT"] }
+      : {
+          accountId: "TEST-PAPER-ACCOUNT",
+          openOrders: [],
+          executions: [
+            { executionId: "a", permId: 44, quantity: 0.5, price: 200, commission: { commission: 0.25 } },
+            { executionId: "b", permId: 44, quantity: 0.5, price: 201, commission: { commission: null } },
+          ],
+        },
+  });
+
+  const report = await client.reconcile();
+  assert.equal(report.executionsByBrokerOrderId["44"].commission, null);
+});
+
+test("IBKR client still rejects a live order without an acknowledgement callback", async () => {
+  const client = new IbkrGatewayClient({
+    accountId: "TEST-PAPER-ACCOUNT",
+    runBridge: async ({ request }) => request.operation === "probe"
+      ? { connected: true, accounts: ["TEST-PAPER-ACCOUNT"] }
+      : {
+          accountId: "TEST-PAPER-ACCOUNT",
+          orderId: 6,
+          whatIf: false,
+          preview: null,
+          fill: null,
+          errors: [{ code: 201, message: "Order rejected" }],
+        },
+  });
+
+  await assert.rejects(
+    () => client.placeOrder({ symbol: "AAPL", side: "BUY", quantity: 1, whatIf: false }),
+    (error) => error.code === "IBKR_ORDER_REJECTED" && error.details.ibkrCode === 201,
+  );
+});
+
 test("shared broker environment config preserves IBKR paper read-only mode", () => {
   assert.equal(createIbkrBrokerFromEnv({ FINANCE_BROKER_MODE: "local" }), null);
   const broker = createIbkrBrokerFromEnv({

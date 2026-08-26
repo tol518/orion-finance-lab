@@ -21,8 +21,9 @@ export function createFinanceClient({ serviceUrl, serviceToken, agentSigningKey,
   const baseUrl = String(serviceUrl).replace(/\/+$/, "");
   const parsedUrl = new URL(baseUrl);
   if (!new Set(["http:", "https:"]).has(parsedUrl.protocol)) throw new Error("Finance Lab serviceUrl must be HTTP(S)");
-  if (!new Set(["127.0.0.1", "[::1]", "localhost"]).has(parsedUrl.hostname)) {
-    throw new Error("Finance Lab serviceUrl must use a loopback host");
+  const localHosts = new Set(["127.0.0.1", "[::1]", "localhost", "host.docker.internal"]);
+  if (!localHosts.has(parsedUrl.hostname)) {
+    throw new Error("Finance Lab serviceUrl must use a local host");
   }
   if (parsedUrl.username || parsedUrl.password) throw new Error("Finance Lab serviceUrl must not contain credentials");
   if (!/^[a-f0-9]{64,}$/i.test(serviceToken ?? "")) throw new Error("Finance Lab serviceToken must be a generated hexadecimal secret");

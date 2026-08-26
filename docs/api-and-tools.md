@@ -15,7 +15,7 @@ Successful calls return `{ "ok": true, "data": <value> }`. Failures return `{ "o
 | `strategy.run` | Deterministic or configured external strategy execution and evidence creation. |
 | `prediction.write` | Append a prediction and immutable supporting evidence. |
 | `trade.propose` | Create a paper-trade proposal and immutable supporting evidence. |
-| `trade.execute` | Submit an owned proposal to deterministic risk and the paper broker. |
+| `trade.execute` | Approve as team lead, or submit/reconcile as the originating team trader; role and proposal-state checks separate those actions. |
 | `experiment.manage` | Create isolated experiment portfolios and run due-prediction evaluation. |
 | `audit.read` | Read evidence manifests and structured audit history. |
 
@@ -26,7 +26,7 @@ Non-operator calls are forced to the trusted caller's own predictions, proposals
 | Method and path | Permission | Purpose |
 | --- | --- | --- |
 | `GET /health` | Bridge bearer token not required at root; dashboard parent auth still applies | Report service and paper mode. |
-| `GET /overview` | Operator/dashboard | Finance Room aggregate. |
+| `GET /overview` | Operator/dashboard | Finance Room aggregate, including recent proposals, fills, and broker-order lifecycle records across team portfolios. |
 | `GET /market/context` | `market.read` | Broad market, volatility, and Treasury proxy quotes. |
 | `GET /market/:symbol/quote` | `market.read` | Current source-stamped quote. |
 | `GET /market/:symbol/history` | `market.read` | OHLCV; query `from`, `to`, `interval=1d|1wk|1mo`. |
@@ -41,7 +41,13 @@ Non-operator calls are forced to the trusted caller's own predictions, proposals
 | `GET /trades` | `portfolio.read` | Paper execution history. |
 | `GET /proposals` | `portfolio.read` | Proposal and risk-resolution history. |
 | `POST /proposals` | `trade.propose` | Create proposal from symbol, side, quantity, thesis, and optional strategy metadata. |
-| `POST /proposals/:id/execute` | `trade.execute` | Run current deterministic checks and execute only the permitted paper quantity. |
+| `POST /proposals/:id/approve` | `trade.execute` | Record approval from the proposal's current rank-1 team lead. The proposal must belong to a non-lead trader on that team. |
+| `POST /proposals/:id/execute` | `trade.execute` | The originating non-lead trader submits a currently lead-approved proposal to deterministic checks and the paper broker. In `dry-run` it returns an IBKR whatIf preview; in `live` it transmits a paper order. |
+| `POST /broker/reconcile` | `trade.execute` | A non-lead trader settles working broker orders and recovers `SUBMITTING` proposals by IBKR `orderRef` for its own team book. Optional `portfolioId` narrows the pass. |
+| `GET /broker/orders` | `portfolio.read` | Recent IBKR paper orders. Operators see all portfolios; team agents are restricted to their team portfolio. |
+| `GET /finance-teams/portfolios` | `portfolio.read` | Per-team paper portfolios plus the combined roll-up across teams. |
+| `GET /finance-teams/context` | `portfolio.read` | The calling agent's role, rank, lead, teammates, and team portfolio. |
+| `POST /finance-teams/:id/lead` | operator | Promote a member to rank-1 team lead. |
 | `GET /broker/status` | `portfolio.read` | Report local or IBKR paper connectivity with masked account identity. |
 | `GET /risk/:portfolioId` | `portfolio.read` | Policy, current metrics, and breaches. |
 | `GET /predictions` | `portfolio.read` | Pending/evaluated prediction ledger. |
@@ -76,7 +82,11 @@ OpenClaw tool names use underscores because they are model-facing tool identifie
 | `finance_get_portfolio` | `portfolio.read` | Valuation snapshot |
 | `finance_get_trade_history` | `portfolio.read` | No |
 | `finance_create_trade_proposal` | `trade.propose` | Proposal and evidence |
-| `finance_execute_paper_trade` | `trade.execute` | Risk event and possible paper execution |
+| `finance_get_trade_proposals` | `portfolio.read` | Own proposals, or all team proposals for the current team lead |
+| `finance_approve_trade_proposal` | `trade.execute` | Rank-1 lead approval for a team trader's proposal |
+| `finance_execute_paper_trade` | `trade.execute` | Risk event and possible paper execution, IBKR preview, or live broker order |
+| `finance_settle_broker_orders` | `trade.execute` | Books completed IBKR fills for the caller's own team book; trader only |
+| `finance_get_team` | `portfolio.read` | None; reads the caller's team hierarchy |
 | `finance_record_prediction` | `prediction.write` | Prediction and evidence |
 | `finance_get_prediction_results` | `portfolio.read` | No |
 | `finance_get_agent_performance` | `portfolio.read` | No |
@@ -100,7 +110,13 @@ Every tool is optional at the OpenClaw layer. A tool appears only when the calli
 | `IBKR_ACCOUNT_NOT_CONFIGURED` | IBKR mode has no explicit paper-account allowlist entry. |
 | `IBKR_ACCOUNT_MISMATCH` | The configured paper account is absent or the bridge returned another account. |
 | `IBKR_GATEWAY_UNAVAILABLE` | IB Gateway, the official Python API, or the loopback bridge is unavailable. |
-| `IBKR_READ_ONLY` | An execution was attempted during the read-only verification stage. |
+| `IBKR_READ_ONLY` | Broker execution was attempted while `FINANCE_IBKR_EXECUTION=off`. |
+| `IBKR_ORDER_REJECTED` | IBKR refused the order. `details.ibkrCode` carries its own code, for example `321` while Gateway still has Read-Only API checked. |
+| `PROPOSAL_ALREADY_RESOLVED` | The proposal already has a broker order or fill; it will not be sent again. |
+| `IBKR_ORDER_REJECTED` | IB Gateway refused the order; the IBKR code and message are returned in `details`. |
+| `FINANCE_TEAM_LEAD_REQUIRED` | An agent other than the current rank-1 lead tried to approve a team proposal. |
+| `FINANCE_TEAM_TRADER_REQUIRED` | A lead, researcher, operator, or non-trader attempted a trader-only team action. |
+| `FINANCE_TEAM_APPROVAL_REQUIRED` | The originating trader attempted submission without approval from the current lead. |
 | `INVALID_SYMBOL` / `INVALID_INPUT` | Boundary validation rejected the request. |
 | `MARKET_RATE_LIMIT` | The provider adapter's bounded request window is full. |
 | `PORTFOLIO_NOT_FOUND` / `PROPOSAL_NOT_FOUND` | Referenced finance object does not exist. |

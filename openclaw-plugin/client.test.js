@@ -15,12 +15,22 @@ test("trade execution is not silently added to defaults", () => {
   assert.equal(permissions.includes("trade.execute"), false);
 });
 
-test("finance client refuses to send credentials to a non-loopback service", () => {
+test("finance client refuses to send credentials to a non-local service", () => {
   assert.throws(() => createFinanceClient({
     serviceUrl: "https://example.com/api",
     serviceToken: "a".repeat(64),
     agentSigningKey: "b".repeat(64),
     agentId: "patrick",
     permissions: ["market.read"],
-  }), /loopback host/);
+  }), /local host/);
+});
+
+test("finance client accepts the Docker Desktop host bridge", () => {
+  assert.doesNotThrow(() => createFinanceClient({
+    serviceUrl: "http://host.docker.internal:4830/api",
+    serviceToken: "a".repeat(64),
+    agentSigningKey: "b".repeat(64),
+    agentId: "patrick",
+    permissions: ["market.read"],
+  }));
 });

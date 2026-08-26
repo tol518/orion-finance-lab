@@ -38,7 +38,10 @@ export function createFinanceRouter({ service, actorForRequest = () => OPERATOR_
   router.get("/trades", route((req, actor) => service.listTrades(actor, req.query)));
   router.get("/proposals", route((req, actor) => service.listProposals(actor, req.query)));
   router.post("/proposals", route((req, actor) => service.createTradeProposal(actor, req.body ?? {})));
+  router.post("/proposals/:proposalId/approve", route((req, actor) => service.approveTradeProposal(actor, req.params.proposalId)));
   router.post("/proposals/:proposalId/execute", route((req, actor) => service.executePaperTrade(actor, req.params.proposalId)));
+  router.post("/broker/reconcile", route((req, actor) => service.reconcileBrokerOrders(actor, req.body ?? {})));
+  router.get("/broker/orders", route((req, actor) => service.listBrokerOrders(actor, req.query)));
   router.get("/risk/:portfolioId", route((req, actor) => service.getRiskState(actor, req.params.portfolioId)));
 
   router.get("/predictions", route((req, actor) => service.listPredictions(actor, req.query)));
@@ -50,7 +53,12 @@ export function createFinanceRouter({ service, actorForRequest = () => OPERATOR_
   router.post("/finance-agents", route((req, actor) => service.assignFinanceAgent(actor, req.body ?? {})));
   router.delete("/finance-agents/:agentId", route((req, actor) => service.removeFinanceAgent(actor, req.params.agentId)));
   router.get("/finance-teams", route((_req, actor) => service.listFinanceTeams(actor)));
+  router.get("/finance-teams/portfolios", route((_req, actor) => service.listTeamPortfolios(actor)));
+  router.get("/finance-teams/context", route((req, actor) => service.getFinanceTeamContext(actor, req.query.agentId)));
   router.post("/finance-teams", route((req, actor) => service.createFinanceTeam(actor, req.body ?? {})));
+  router.post("/finance-teams/:teamId/members", route((req, actor) => service.addFinanceTeamMembers(actor, req.params.teamId, req.body ?? {})));
+  router.delete("/finance-teams/:teamId/members/:agentId", route((req, actor) => service.removeFinanceTeamMember(actor, req.params.teamId, req.params.agentId)));
+  router.post("/finance-teams/:teamId/lead", route((req, actor) => service.promoteFinanceTeamLead(actor, req.params.teamId, req.body?.agentId)));
   router.delete("/finance-teams/:teamId", route((req, actor) => service.removeFinanceTeam(actor, req.params.teamId)));
 
   router.get("/experiments", route((_req, actor) => service.listExperiments(actor)));
