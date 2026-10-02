@@ -819,6 +819,128 @@ function liveFillOrder({ filledQuantity, averageFillPrice, commission, status = 
   });
 }
 
+function completedFillReport() {
+  return {
+    accountIdMasked: "T***UNT", openOrders: [],
+    executionsByBrokerOrderId: {
+      9001: { executions: [{ executionId: "exec-auto", quantity: 5, price: 102 }], filledQuantity: 5, averageFillPrice: 102, commission: 1.4 },
+    },
+    retrievedAt: "2026-08-24T10:00:00.000Z",
+  };
+}
+
+test("startup automatically settles working fills once alongside manual reconciliation", async (t) => {
+  const broker = fakeIbkrBroker({
+    onPlaceOrder: liveFillOrder({ filledQuantity: 0, averageFillPrice: null, commission: null, status: "PreSubmitted" }),
+    reconcileReport: completedFillReport(),
+  });
+  const { service, store } = setup({ broker, ibkrExecution: "live" });
+  t.after(() => service.close());
+  const team = await teamWithLead(service);
+  const { trader, proposal } = await approvedTraderProposal(service, team);
+  await service.executePaperTrade(trader, proposal.id);
+  service.start();
+  service.start();
+  const manual = await service.reconcileBrokerOrders(trader);
+  assert.equal(manual.checked, 0);
+  assert.equal(broker.reconcileCalls.length, 1);
+  assert.equal(broker.orders.length, 1);
+  assert.equal(store.listTrades({ portfolioId: team.portfolioId }).length, 1);
+  assert.equal(store.listBrokerOrders({ portfolioId: team.portfolioId })[0].status, "FILLED");
+  assert.equal(store.getPortfolio(team.portfolioId).cash, 100_000 - (5 * 102 + 1.4));
+});
+
+test("automatic reconciliation retries a Gateway failure and stops broker reads after settlement", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const broker = fakeIbkrBroker({ onPlaceOrder: liveFillOrder({ filledQuantity: 0, averageFillPrice: null, commission: null, status: "Submitted" }) });
+  let reads = 0;
+  broker.reconcile = async () => {
+    reads += 1;
+    if (reads === 1) throw new Error("Gateway temporarily unavailable");
+    return completedFillReport();
+  };
+  const { service, store } = setup({ broker, ibkrExecution: "live" });
+  const errors = [];
+  service.logger = { error(message) { errors.push(message); } };
+  t.after(() => service.close());
+  const team = await teamWithLead(service);
+  const { trader, proposal } = await approvedTraderProposal(service, team);
+  await service.executePaperTrade(trader, proposal.id);
+  service.start();
+  await new Promise(setImmediate);
+  assert.equal(reads, 1);
+  assert.equal(errors.length, 1);
+  assert.equal(store.getProposal(proposal.id).status, "WORKING");
+  t.mock.timers.tick(15_000);
+  await new Promise(setImmediate);
+  assert.equal(reads, 2);
+  assert.equal(store.listTrades({ portfolioId: team.portfolioId }).length, 1);
+  t.mock.timers.tick(15_000);
+  await new Promise(setImmediate);
+  assert.equal(reads, 2);
+});
+
+test("shutdown drains an active broker reconciliation before closing the ledger", async (t) => {
+  const broker = fakeIbkrBroker({ onPlaceOrder: liveFillOrder({ filledQuantity: 0, averageFillPrice: null, commission: null, status: "Submitted" }) });
+  let resolveRead;
+  broker.reconcile = () => new Promise((resolve) => { resolveRead = resolve; });
+  const { service, store } = setup({ broker, ibkrExecution: "live" });
+  t.after(() => service.close());
+  const team = await teamWithLead(service);
+  const { trader, proposal } = await approvedTraderProposal(service, team);
+  await service.executePaperTrade(trader, proposal.id);
+  service.start();
+  await new Promise(setImmediate);
+  let closed = false;
+  const closing = service.close().then(() => { closed = true; });
+  await new Promise(setImmediate);
+  assert.equal(closed, false);
+  assert.equal(store.getProposal(proposal.id).status, "WORKING");
+  resolveRead(completedFillReport());
+  await closing;
+  assert.equal(closed, true);
+  assert.equal(service.reconciliationTimer, null);
+});
+
+test("read-only and dry-run modes never start automatic broker reconciliation", async () => {
+  for (const ibkrExecution of ["off", "dry-run"]) {
+    const broker = fakeIbkrBroker();
+    const { service } = setup({ broker, ibkrExecution });
+    service.start();
+    await new Promise(setImmediate);
+    assert.equal(broker.reconcileCalls.length, 0);
+    await service.close();
+  }
+});
+
+test("automatic reconciliation cannot duplicate a submission that settles while its snapshot is in flight", async (t) => {
+  let releasePlacement;
+  const broker = fakeIbkrBroker({
+    onPlaceOrder: (input) => new Promise((resolve) => {
+      releasePlacement = () => resolve(liveFillOrder({ filledQuantity: 5, averageFillPrice: 102, commission: 1.4 })(input));
+    }),
+  });
+  const { service, store } = setup({ broker, ibkrExecution: "live" });
+  t.after(() => service.close());
+  const team = await teamWithLead(service);
+  const { trader, proposal } = await approvedTraderProposal(service, team);
+  const report = completedFillReport();
+  report.executionsByBrokerOrderId[9001].orderRef = proposal.id;
+  broker.reconcile = async () => report;
+  const submission = service.executePaperTrade(trader, proposal.id);
+  await new Promise(setImmediate);
+  assert.equal(store.getProposal(proposal.id).status, "SUBMITTING");
+  service.start();
+  const reconciliation = service.reconcileBrokerOrders(trader);
+  await new Promise(setImmediate);
+  releasePlacement();
+  await submission;
+  await reconciliation;
+  assert.equal(store.listTrades({ portfolioId: team.portfolioId }).length, 1);
+  assert.equal(store.listBrokerOrders({ portfolioId: team.portfolioId }).length, 1);
+  assert.equal(store.getPortfolio(team.portfolioId).cash, 100_000 - (5 * 102 + 1.4));
+});
+
 test("live mode books the broker's own fill price and commission, not the local quote", async (t) => {
   const broker = fakeIbkrBroker({ onPlaceOrder: liveFillOrder({ filledQuantity: 5, averageFillPrice: 101.5, commission: 1.25 }) });
   const { service, store } = setup({ broker, ibkrExecution: "live" });
@@ -1064,6 +1186,26 @@ test("reconciliation upgrades a client-order fallback to permId", async (t) => {
 
   await service.reconcileBrokerOrders(trader);
   assert.equal(store.getBrokerOrder(placed.brokerOrder.id).brokerOrderId, "9009");
+});
+
+test("reconciliation never adopts an unrelated fill with a reused session order ID", async (t) => {
+  const broker = fakeIbkrBroker({ onPlaceOrder: liveFillOrder({ filledQuantity: 0, averageFillPrice: null, commission: null, status: "Submitted" }) });
+  const { service, store } = setup({ broker, ibkrExecution: "live" });
+  t.after(() => service.close());
+  const team = await teamWithLead(service);
+  const { trader, proposal } = await approvedTraderProposal(service, team);
+  const placed = await service.executePaperTrade(trader, proposal.id);
+  broker.reconcile = async () => ({
+    accountIdMasked: "T***UNT", openOrders: [],
+    completedOrders: [{ brokerOrderId: "9002", clientOrderId: 17, orderRef: "another-proposal", symbol: "MU", status: "Filled" }],
+    executionsByBrokerOrderId: { 9002: { orderRef: "another-proposal", executions: [{ executionId: "unrelated-fill", quantity: 5, price: 102 }], filledQuantity: 5, averageFillPrice: 102, commission: 1.4 } },
+  });
+  await service.reconcileBrokerOrders(trader);
+  const order = store.getBrokerOrder(placed.brokerOrder.id);
+  assert.equal(order.brokerOrderId, "9001");
+  assert.equal(order.status, "WORKING");
+  assert.equal(order.filledQuantity, 0);
+  assert.equal(store.listTrades({ portfolioId: team.portfolioId }).length, 0);
 });
 
 test("reconciliation adopts an ambiguously transmitted proposal by orderRef", async (t) => {

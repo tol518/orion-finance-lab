@@ -70,6 +70,8 @@ Every finance team owns one paper portfolio, and `finance_team_members.team_rank
 
 ### Autonomous team cycles
 
+In IBKR live paper mode, the service reconciles unresolved submissions and working orders at startup and every 15 seconds after the previous check finishes. Confirmed fills and commissions settle through the existing ledger path exactly once. Polling skips Gateway calls when no orders need settlement, retries connection failures on the next check, and drains active settlement before SQLite closes. Manual trader reconciliation remains scoped to the caller's team. The dashboard refreshes every five seconds while an order is unresolved, including across tab navigation.
+
 The Finance Room's **Start Trading** action authorizes one paper cycle. The coordinator runs research → lead strategy → trader proposal → lead approval → trader submission using the team's stored roles. Strategy planning authorizes drafting; it does not approve an order. The lead must approve the concrete proposal before its proposing trader can submit.
 
 Every research, planning, and proposal handoff includes the team's current paper portfolio, risk policy, and execution mode. Lead approval receives a refreshed portfolio, the full proposal thesis, research, lead strategy, a source-stamped quote, and an indicative sizing check. Execution still reruns the authoritative risk and cost checks.

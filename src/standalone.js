@@ -34,8 +34,8 @@ let stopping = false;
 async function shutdown() {
   if (stopping) return;
   stopping = true;
-  service.close();
   await new Promise((resolve) => server.close(resolve));
+  await service.close();
 }
 process.on("SIGINT", () => void shutdown());
 process.on("SIGTERM", () => void shutdown());

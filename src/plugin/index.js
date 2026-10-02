@@ -68,7 +68,7 @@ const plugin = {
     teamTrading = undefined;
     if (agentBridge) await new Promise((resolve) => agentBridge.close(resolve));
     agentBridge = undefined;
-    financeLab?.close();
+    await financeLab?.close();
     financeLab = undefined;
   },
 };

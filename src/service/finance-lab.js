@@ -81,23 +81,57 @@ export class FinanceLabService {
     this.defaultPortfolio = this.store.ensureDefaultPortfolio();
     this.store.ensureTeamPortfolios();
     this.evaluationTimer = null;
+    this.reconciliationTimer = null;
+    this.reconciliationRun = null;
+    this.closePromise = null;
     this.executionQueues = new Map();
   }
 
   start() {
-    if (this.evaluationTimer) return;
+    if (this.evaluationTimer || this.closePromise) return;
     this.evaluationTimer = setInterval(() => {
       this.predictions.evaluateDue().catch((error) => {
         this.logger.error(`[finance-lab] prediction evaluation failed: ${error.message}`);
       });
     }, 60 * 60 * 1000);
     this.evaluationTimer.unref?.();
+    if (this.ibkrBroker && this.ibkrExecution === "live") void this.#pollBrokerOrders();
   }
 
   close() {
+    if (this.closePromise) return this.closePromise;
     if (this.evaluationTimer) clearInterval(this.evaluationTimer);
+    if (this.reconciliationTimer) clearTimeout(this.reconciliationTimer);
     this.evaluationTimer = null;
-    this.store.close();
+    this.reconciliationTimer = null;
+    // A broker read can still be settling a fill. Drain it before closing SQLite.
+    this.closePromise = Promise.resolve(this.reconciliationRun).catch(() => undefined).then(() => this.store.close());
+    return this.closePromise;
+  }
+
+  async #pollBrokerOrders() {
+    try {
+      await this.#queueReconciliation();
+    } catch (error) {
+      this.logger.error(`[finance-lab] broker reconciliation failed: ${error.message}`);
+    } finally {
+      // Schedule after completion so a slow/disconnected Gateway never stacks polling calls.
+      if (!this.closePromise) {
+        this.reconciliationTimer = setTimeout(() => void this.#pollBrokerOrders(), 15_000);
+        this.reconciliationTimer.unref?.();
+      }
+    }
+  }
+
+  #queueReconciliation(portfolioId) {
+    if (this.closePromise) return Promise.reject(new Error("Finance Lab is shutting down"));
+    // Manual trader requests and the service-owned poll share the same settlement queue.
+    const prior = this.reconciliationRun ?? Promise.resolve();
+    const run = prior.catch(() => undefined).then(() => this.#settleBrokerOrders(portfolioId));
+    this.reconciliationRun = run;
+    return run.finally(() => {
+      if (this.reconciliationRun === run) this.reconciliationRun = null;
+    });
   }
 
   getQuote(actor, symbol) {
@@ -1068,6 +1102,10 @@ export class FinanceLabService {
     }
     this.#assertIbkrExecutionEnabled();
     const portfolioId = this.#reconcileScope(actor, options.portfolioId);
+    return this.#queueReconciliation(portfolioId);
+  }
+
+  async #settleBrokerOrders(portfolioId) {
     const working = this.store.listWorkingBrokerOrders({ portfolioId });
     const submitting = this.store.listSubmittingProposals({ portfolioId });
     if (working.length === 0 && submitting.length === 0) {
@@ -1084,23 +1122,28 @@ export class FinanceLabService {
         pendingSubmissions += 1;
         continue;
       }
-      const outcome = await this.#serializeExecution(proposal.portfolioId, async () =>
-        this.store.applyBrokerDecision({
-          proposal,
+      const outcome = await this.#serializeExecution(proposal.portfolioId, async () => {
+        // Submission may have finished while the broker snapshot was in flight.
+        // Only recover a claim that is still unresolved inside the execution queue.
+        const current = this.store.getProposal(proposal.id);
+        if (current?.status !== "SUBMITTING") return null;
+        return this.store.applyBrokerDecision({
+          proposal: current,
           decision,
           settlement,
           accountMasked: report.accountIdMasked,
           riskEventId: decision.riskEventId,
-        }),
-      );
+        });
+      });
+      if (!outcome) continue;
       (outcome.brokerOrder.status === "WORKING" ? stillWorking : settled).push(outcome.brokerOrder);
     }
     for (const brokerOrder of working) {
-      const brokerMatch = [...report.openOrders, ...(report.completedOrders ?? [])].find((item) =>
-        item.brokerOrderId === brokerOrder.brokerOrderId ||
-        item.clientOrderId === brokerOrder.clientOrderId ||
-        item.orderRef === brokerOrder.proposalId,
-      );
+      // Session order IDs can be reused. Only the permanent broker ID or our proposal
+      // reference proves identity; a reused client ID must never adopt another order's fill.
+      const brokerOrders = [...report.openOrders, ...(report.completedOrders ?? [])];
+      const brokerMatch = brokerOrders.find((item) => item.brokerOrderId === brokerOrder.brokerOrderId)
+        ?? brokerOrders.find((item) => item.orderRef === brokerOrder.proposalId);
       const resolvedBrokerOrderId = brokerMatch?.brokerOrderId ?? brokerOrder.brokerOrderId;
       if (resolvedBrokerOrderId && resolvedBrokerOrderId !== brokerOrder.brokerOrderId) {
         this.store.upgradeBrokerOrderIdentity(brokerOrder.id, resolvedBrokerOrderId);

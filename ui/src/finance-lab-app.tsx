@@ -87,6 +87,13 @@ export default function FinanceLabApp({ apiBase }: { apiBase: string }) {
 
   useEffect(() => { void load(); }, [load]);
   const refresh = useCallback(() => void load(true), [load]);
+  const unsettled = Boolean(overview?.recentBrokerOrders.some((order) => order.status === "WORKING")
+    || overview?.recentProposals.some((proposal) => proposal.status === "SUBMITTING"));
+  useEffect(() => {
+    if (!unsettled) return;
+    const timer = window.setInterval(() => void load(true), 5000);
+    return () => window.clearInterval(timer);
+  }, [unsettled, load]);
 
   if (loading) return <StateMessage icon={<LoaderCircle className="spin" />} title="Opening Finance Lab" detail="Loading paper portfolios and risk state." />;
   if (!overview) return <StateMessage icon={<ShieldCheck />} title="Finance Lab is unavailable" detail={error ?? "The plugin did not return a dashboard."} action={<button className="button" onClick={() => void load()}><RefreshCw size={15} /> Retry</button>} />;
