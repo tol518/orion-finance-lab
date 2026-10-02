@@ -2,7 +2,7 @@ import express from "express";
 import { serializeError } from "./validation.js";
 import { OPERATOR_ACTOR } from "../service/finance-lab.js";
 
-export function createFinanceRouter({ service, actorForRequest = () => OPERATOR_ACTOR }) {
+export function createFinanceRouter({ service, teamTrading, actorForRequest = () => OPERATOR_ACTOR }) {
   const router = express.Router();
   const route = (handler) => async (req, res) => {
     try {
@@ -39,6 +39,7 @@ export function createFinanceRouter({ service, actorForRequest = () => OPERATOR_
   router.get("/proposals", route((req, actor) => service.listProposals(actor, req.query)));
   router.post("/proposals", route((req, actor) => service.createTradeProposal(actor, req.body ?? {})));
   router.post("/proposals/:proposalId/approve", route((req, actor) => service.approveTradeProposal(actor, req.params.proposalId)));
+  router.post("/proposals/:proposalId/reject", route((req, actor) => service.rejectTradeProposal(actor, req.params.proposalId)));
   router.post("/proposals/:proposalId/execute", route((req, actor) => service.executePaperTrade(actor, req.params.proposalId)));
   router.post("/broker/reconcile", route((req, actor) => service.reconcileBrokerOrders(actor, req.body ?? {})));
   router.get("/broker/orders", route((req, actor) => service.listBrokerOrders(actor, req.query)));
@@ -53,6 +54,11 @@ export function createFinanceRouter({ service, actorForRequest = () => OPERATOR_
   router.post("/finance-agents", route((req, actor) => service.assignFinanceAgent(actor, req.body ?? {})));
   router.delete("/finance-agents/:agentId", route((req, actor) => service.removeFinanceAgent(actor, req.params.agentId)));
   router.get("/finance-teams", route((_req, actor) => service.listFinanceTeams(actor)));
+  if (teamTrading) {
+    router.get("/finance-teams/trading", route(() => teamTrading.list()));
+    router.post("/finance-teams/:teamId/trading/start", route((req) => teamTrading.start(req.params.teamId)));
+    router.post("/finance-teams/:teamId/trading/stop", route((req) => teamTrading.stop(req.params.teamId)));
+  }
   router.get("/finance-teams/portfolios", route((_req, actor) => service.listTeamPortfolios(actor)));
   router.get("/finance-teams/context", route((req, actor) => service.getFinanceTeamContext(actor, req.query.agentId)));
   router.post("/finance-teams", route((req, actor) => service.createFinanceTeam(actor, req.body ?? {})));

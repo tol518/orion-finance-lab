@@ -1414,6 +1414,80 @@ textarea:focus {
   font-weight: 600;
 }
 
+.team-portfolio-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.team-trading-state {
+  display: flex;
+  min-height: 38px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  margin: 0 0 14px;
+  padding: 8px 10px;
+}
+
+.team-trading-state span {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 7px;
+  color: var(--text-strong);
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.team-trading-state i {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--muted);
+}
+
+.team-trading-state small {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 10px;
+  text-align: right;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.team-trading-state.state-running i {
+  background: var(--cyan);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--cyan) 12%, transparent);
+}
+
+.team-trading-state.state-completed i {
+  background: var(--green);
+}
+
+.team-trading-state.state-failed i {
+  background: var(--red);
+}
+
+.team-trading-state.state-stopped i {
+  background: var(--amber);
+}
+
+.team-trading-error {
+  margin: -8px 0 14px;
+  padding: 7px 10px;
+  border: 1px solid color-mix(in srgb, var(--red) 45%, var(--border));
+  border-radius: 5px;
+  background: color-mix(in srgb, var(--red) 9%, transparent);
+  color: var(--red);
+  font-size: 10px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
 .team-member {
   display: inline-flex;
   align-items: center;

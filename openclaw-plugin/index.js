@@ -46,6 +46,7 @@ const TOOL_NAMES = [
   "finance_get_trade_proposals",
   "finance_create_trade_proposal",
   "finance_approve_trade_proposal",
+  "finance_reject_trade_proposal",
   "finance_execute_paper_trade",
   "finance_settle_broker_orders",
   "finance_record_prediction",
@@ -127,6 +128,9 @@ function createTools(client, permissions) {
     tool("finance_approve_trade_proposal", "Approve a trader's team proposal as the current rank-1 team lead.", "trade.execute", Type.Object({
       proposalId: Type.String({ minLength: 1, maxLength: 128 }),
     }), (params, signal) => client.request(`/proposals/${encodeURIComponent(params.proposalId)}/approve`, { method: "POST", signal })),
+    tool("finance_reject_trade_proposal", "Reject a trader's team proposal as the current rank-1 team lead.", "trade.execute", Type.Object({
+      proposalId: Type.String({ minLength: 1, maxLength: 128 }),
+    }), (params, signal) => client.request(`/proposals/${encodeURIComponent(params.proposalId)}/reject`, { method: "POST", signal })),
     tool("finance_execute_paper_trade", "Submit your team-lead-approved trader proposal to deterministic risk checks and the paper broker.", "trade.execute", Type.Object({
       proposalId: Type.String({ minLength: 1, maxLength: 128 }),
     }), (params, signal) => client.request(`/proposals/${encodeURIComponent(params.proposalId)}/execute`, { method: "POST", signal })),

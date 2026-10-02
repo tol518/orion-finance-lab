@@ -198,6 +198,23 @@ export type TeamPortfolios = {
   total: TeamPortfolioTotal;
 };
 
+export type TeamTradingRun = {
+  teamId: string;
+  teamName: string;
+  available: boolean;
+  status: "IDLE" | "RUNNING" | "COMPLETED" | "STOPPED" | "FAILED";
+  phase: string;
+  message: string;
+  researcherAgentId: string | null;
+  traderAgentId: string | null;
+  leadAgentId: string | null;
+  proposalId: string | null;
+  error: string | null;
+  startedAt: string | null;
+  updatedAt: string;
+  completedAt: string | null;
+};
+
 export type Strategy = {
   id: string;
   name: string;

@@ -395,40 +395,16 @@ export class FinanceLabService {
   }
 
   approveTradeProposal(actor, proposalId) {
-    assertPermission(actor, "trade.execute");
-    const proposal = this.store.getProposal(requiredString(proposalId, "proposalId", { max: 128 }));
-    if (!proposal) throw new FinanceError("Trade proposal not found", { code: "PROPOSAL_NOT_FOUND", status: 404 });
-    if (!["PROPOSED", "LEAD_APPROVED"].includes(proposal.status)) {
-      throw new FinanceError("Trade proposal has already been resolved", {
-        code: "PROPOSAL_ALREADY_RESOLVED",
-        status: 409,
-      });
-    }
-    const portfolio = this.store.getPortfolio(proposal.portfolioId);
-    if (!portfolio) throw new FinanceError("Portfolio not found", { code: "PORTFOLIO_NOT_FOUND", status: 404 });
-    const team = this.#assertPortfolioAccess(actor, portfolio);
-    if (!team) {
-      throw new FinanceError("Team-lead approval applies only to finance team portfolios", {
-        code: "FINANCE_TEAM_REQUIRED",
-        status: 409,
-      });
-    }
-    if (team.leadAgentId !== trustedAgentId(actor)) {
-      throw new FinanceError("Only the finance team lead can approve its trade proposals", {
-        code: "FINANCE_TEAM_LEAD_REQUIRED",
-        status: 403,
-        details: { leadAgentId: team.leadAgentId },
-      });
-    }
-    const proposer = team.members.find((member) => member.agentId === proposal.agentId);
-    if (!proposer || proposer.lead || !isTraderRole(proposer.role)) {
-      throw new FinanceError("A team lead may approve only a proposal created by one of the team's trader agents", {
-        code: "FINANCE_TEAM_TRADER_REQUIRED",
-        status: 409,
-      });
-    }
+    const proposal = this.#proposalForLeadDecision(actor, proposalId);
     return this.#audited("trade.approve", actor, proposal, () =>
       this.store.approveProposal({ proposalId: proposal.id, leadAgentId: trustedAgentId(actor) }),
+    );
+  }
+
+  rejectTradeProposal(actor, proposalId) {
+    const proposal = this.#proposalForLeadDecision(actor, proposalId);
+    return this.#audited("trade.reject", actor, proposal, () =>
+      this.store.rejectProposal({ proposalId: proposal.id }),
     );
   }
 
@@ -929,6 +905,42 @@ export class FinanceLabService {
     }
   }
 
+  #proposalForLeadDecision(actor, proposalId) {
+    assertPermission(actor, "trade.execute");
+    const proposal = this.store.getProposal(requiredString(proposalId, "proposalId", { max: 128 }));
+    if (!proposal) throw new FinanceError("Trade proposal not found", { code: "PROPOSAL_NOT_FOUND", status: 404 });
+    if (proposal.status !== "PROPOSED") {
+      throw new FinanceError("Trade proposal has already been resolved", {
+        code: "PROPOSAL_ALREADY_RESOLVED",
+        status: 409,
+      });
+    }
+    const portfolio = this.store.getPortfolio(proposal.portfolioId);
+    if (!portfolio) throw new FinanceError("Portfolio not found", { code: "PORTFOLIO_NOT_FOUND", status: 404 });
+    const team = this.#assertPortfolioAccess(actor, portfolio);
+    if (!team) {
+      throw new FinanceError("Team-lead review applies only to finance team portfolios", {
+        code: "FINANCE_TEAM_REQUIRED",
+        status: 409,
+      });
+    }
+    if (team.leadAgentId !== trustedAgentId(actor)) {
+      throw new FinanceError("Only the finance team lead can review its trade proposals", {
+        code: "FINANCE_TEAM_LEAD_REQUIRED",
+        status: 403,
+        details: { leadAgentId: team.leadAgentId },
+      });
+    }
+    const proposer = team.members.find((member) => member.agentId === proposal.agentId);
+    if (!proposer || proposer.lead || !isTraderRole(proposer.role)) {
+      throw new FinanceError("A team lead may review only a proposal created by one of the team's trader agents", {
+        code: "FINANCE_TEAM_TRADER_REQUIRED",
+        status: 409,
+      });
+    }
+    return proposal;
+  }
+
   #assertTeamTrader(actor, team, action) {
     if (actor.operator) {
       throw new FinanceError(`Only a team trader agent can ${action}`, {
@@ -1181,6 +1193,17 @@ export class FinanceLabService {
     const started = performance.now();
     try {
       const result = await work();
+      const payload = sanitizeAuditPayload(refs);
+      // Previews and IBKR risk refusals leave proposals approved. Persist the result
+      // so orchestration can observe tool execution without sending it a second time.
+      if (action === "trade.execute" || action === "trade.preview") {
+        payload.execution = {
+          mode: result.mode ?? "paper",
+          status: result.decision.status,
+          reasons: result.decision.reasons,
+          previewed: Boolean(result.preview),
+        };
+      }
       this.store.recordAudit({
         action,
         actorId: actor?.actorId,
@@ -1192,7 +1215,7 @@ export class FinanceLabService {
         predictionId: refs.predictionId,
         success: true,
         latencyMs: Math.round(performance.now() - started),
-        payload: sanitizeAuditPayload(refs),
+        payload,
       });
       return result;
     } catch (error) {

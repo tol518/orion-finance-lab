@@ -4,10 +4,12 @@ import { FinanceLabService } from "../service/finance-lab.js";
 import { createFinanceRouter } from "../api/router.js";
 import { listenFinanceService } from "../api/service-app.js";
 import { createIbkrBrokerFromEnv, resolveIbkrExecutionMode } from "../broker/ibkr-config.js";
+import { TeamTradingCoordinator } from "../automation/team-trading-coordinator.js";
 
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 let financeLab;
 let agentBridge;
+let teamTrading;
 
 /** @satisfies {import("@orion-os/plugin-sdk").OrionPlugin} */
 const plugin = {
@@ -31,6 +33,11 @@ const plugin = {
       },
     });
     financeLab.start();
+    teamTrading = new TeamTradingCoordinator({
+      service: financeLab,
+      agentRuntime: context.agentRuntime,
+      logger: context.logger,
+    });
     const serviceToken = process.env.FINANCE_SERVICE_TOKEN;
     const signingKey = process.env.FINANCE_AGENT_SIGNING_KEY;
     if (serviceToken && signingKey) {
@@ -45,7 +52,7 @@ const plugin = {
     } else {
       context.logger.warn("[finance-lab] Finance bridge secrets are unset; dashboard works, agent tools stay disconnected");
     }
-    context.mountApi(createFinanceRouter({ service: financeLab }));
+    context.mountApi(createFinanceRouter({ service: financeLab, teamTrading }));
     context.mountAssets(path.join(rootDir, "ui", "dist"));
     context.registerUi({
       route: "finance",
@@ -57,6 +64,8 @@ const plugin = {
     });
   },
   async shutdown() {
+    await teamTrading?.close();
+    teamTrading = undefined;
     if (agentBridge) await new Promise((resolve) => agentBridge.close(resolve));
     agentBridge = undefined;
     financeLab?.close();

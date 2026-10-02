@@ -715,6 +715,31 @@ test("a trader submits only after the current team lead approves", async (t) => 
   assert.equal(broker.orders.at(-1).quantity, result.decision.approvedQuantity);
 });
 
+test("the current team lead can reject a trader proposal without human approval", async (t) => {
+  const { service } = setup();
+  t.after(() => service.close());
+  const team = await teamWithLead(service);
+  const { lead, researcher, trader } = teamActors();
+  const proposal = await service.createTradeProposal(trader, {
+    portfolioId: team.portfolioId,
+    symbol: "AAPL",
+    side: "BUY",
+    quantity: 5,
+    thesis: "Team lead should reject this paper proposal.",
+  });
+
+  assert.throws(
+    () => service.rejectTradeProposal(researcher, proposal.id),
+    (error) => error.code === "FINANCE_TEAM_LEAD_REQUIRED",
+  );
+  const rejected = await service.rejectTradeProposal(lead, proposal.id);
+  assert.equal(rejected.status, "REJECTED");
+  await assert.rejects(
+    () => service.executePaperTrade(trader, proposal.id),
+    (error) => error.code === "PROPOSAL_ALREADY_RESOLVED",
+  );
+});
+
 test("approval from a former lead becomes stale after leadership changes", async (t) => {
   const broker = fakeIbkrBroker();
   const { service } = setup({ broker, ibkrExecution: "dry-run" });

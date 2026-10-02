@@ -68,6 +68,16 @@ A live order is the broker's event, not the lab's, so the lab does not decide wh
 
 Every finance team owns one paper portfolio, and `finance_team_members.team_rank` orders the team with rank 1 as its lead. A non-lead member whose assigned role contains `Trader` creates the proposal. The current rank-1 lead must approve it, and the same trader then submits it to the broker. Approval records the lead identity and becomes invalid if leadership changes before submission. Agents read their own place in the hierarchy through `GET /finance-teams/context` rather than being told it in a prompt.
 
+### Autonomous team cycles
+
+The Finance Room's **Start Trading** action authorizes one paper cycle. The coordinator runs research → lead strategy → trader proposal → lead approval → trader submission using the team's stored roles. Strategy planning authorizes drafting; it does not approve an order. The lead must approve the concrete proposal before its proposing trader can submit.
+
+Every research, planning, and proposal handoff includes the team's current paper portfolio, risk policy, and execution mode. Lead approval receives a refreshed portfolio, the full proposal thesis, research, lead strategy, a source-stamped quote, and an indicative sizing check. Execution still reruns the authoritative risk and cost checks.
+
+Research considers up to three candidates within supported capabilities: cash-funded buys of permitted equities/ETFs and sells of held positions. A sell cannot open a short; options and atomic paired orders are unsupported. Team disposition guides analysis. Neutral disposition means choosing without a fixed directional bias; an explicit portfolio mandate still governs. Ordinary uncertainty can justify a smaller paper position, while insufficient evidence or a hard risk limit can justify no trade.
+
+No-trade and explicit rejection reasons remain visible in the cycle status. Completed, stopped, and failed cycles also write their outcome to the existing SQLite `audit_log` under `finance.team.trading.complete`. A missing or malformed lead decision fails the cycle and leaves its proposal unresolved; it never becomes implicit approval or a fabricated investment rejection. The cycle status remains process-local, while the audit survives restarts.
+
 ## Decision and execution flow
 
 ```mermaid

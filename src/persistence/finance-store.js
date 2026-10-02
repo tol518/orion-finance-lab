@@ -517,6 +517,22 @@ export class FinanceStore {
     return this.getProposal(proposalId);
   }
 
+  rejectProposal({ proposalId }) {
+    const resolvedAt = new Date().toISOString();
+    const result = this.db.prepare(`
+      UPDATE trade_proposals
+      SET status = 'REJECTED', approved_quantity = 0, resolved_at = ?
+      WHERE id = ? AND status = 'PROPOSED'
+    `).run(resolvedAt, proposalId);
+    if (result.changes !== 1) {
+      throw new FinanceError("Trade proposal is not waiting for team-lead review", {
+        code: "PROPOSAL_NOT_AWAITING_APPROVAL",
+        status: 409,
+      });
+    }
+    return this.getProposal(proposalId);
+  }
+
   claimProposalForBroker({ proposalId, leadAgentId, traderAgentId, decision }) {
     const proposal = this.getProposal(proposalId);
     const riskEventId = randomUUID();
@@ -601,6 +617,16 @@ export class FinanceStore {
       policy: JSON.parse(row.policy_json),
       snapshot: JSON.parse(row.snapshot_json),
     };
+  }
+
+  getProposalExecutionResult(proposalId) {
+    const row = this.db.prepare(`
+      SELECT audit.payload_json FROM audit_log AS audit
+      JOIN trade_proposals AS proposal ON proposal.decision_id = audit.decision_id
+      WHERE proposal.id = ? AND audit.action IN ('trade.execute', 'trade.preview') AND audit.success = 1
+      ORDER BY audit.created_at DESC, audit.rowid DESC LIMIT 1
+    `).get(proposalId);
+    return row ? JSON.parse(row.payload_json).execution ?? null : null;
   }
 
   // Cash and position movement for one fill. Paper simulation and a real broker fill differ

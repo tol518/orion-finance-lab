@@ -1,4 +1,4 @@
-import { type FormEvent, type ReactNode, useCallback, useEffect, useState } from "react";
+import { type FormEvent, type ReactNode, useCallback, useEffect, useRef, useState } from "react";
 import {
   Activity,
   ArrowDownRight,
@@ -15,9 +15,11 @@ import {
   History,
   LineChart,
   LoaderCircle,
+  Play,
   RefreshCw,
   Search,
   ShieldCheck,
+  Square,
   Target,
   Trash2,
   UserPlus,
@@ -44,6 +46,7 @@ import type {
   TeamPortfolio,
   TeamPortfolios,
   TeamPortfolioTotal,
+  TeamTradingRun,
   Trade,
 } from "./types";
 
@@ -83,11 +86,11 @@ export default function FinanceLabApp({ apiBase }: { apiBase: string }) {
   }, [request]);
 
   useEffect(() => { void load(); }, [load]);
+  const refresh = useCallback(() => void load(true), [load]);
 
   if (loading) return <StateMessage icon={<LoaderCircle className="spin" />} title="Opening Finance Lab" detail="Loading paper portfolios and risk state." />;
   if (!overview) return <StateMessage icon={<ShieldCheck />} title="Finance Lab is unavailable" detail={error ?? "The plugin did not return a dashboard."} action={<button className="button" onClick={() => void load()}><RefreshCw size={15} /> Retry</button>} />;
 
-  const refresh = () => void load(true);
   return (
     <section className="finance-shell">
       <header className="finance-header">
@@ -111,7 +114,7 @@ export default function FinanceLabApp({ apiBase }: { apiBase: string }) {
       </nav>
 
       {tab === "Overview" && <OverviewView overview={overview} request={request} refresh={refresh} onResearch={setResearchResult} onNavigate={setTab} />}
-      {tab === "Portfolio" && <PortfolioView portfolio={overview.portfolio} teamPortfolios={overview.teamPortfolios} brokerOrders={overview.recentBrokerOrders} mode={overview.mode} />}
+      {tab === "Portfolio" && <PortfolioView portfolio={overview.portfolio} teamPortfolios={overview.teamPortfolios} brokerOrders={overview.recentBrokerOrders} mode={overview.mode} request={request} refresh={refresh} />}
       {tab === "Trades" && <TradesView trades={overview.recentTrades} proposals={overview.recentProposals} brokerOrders={overview.recentBrokerOrders} financeTeams={overview.financeTeams} teamPortfolios={overview.teamPortfolios} defaultCurrency={overview.portfolio.currency} mode={overview.mode} request={request} refresh={refresh} />}
       {tab === "Predictions" && <PredictionsView predictions={overview.recentPredictions} request={request} refresh={refresh} />}
       {tab === "Agents" && <AgentsView agents={overview.agents} financeAgents={overview.financeAgents} financeTeams={overview.financeTeams} request={request} refresh={refresh} />}
@@ -224,8 +227,48 @@ function RiskBar({ label, value, limit }: { label: string; value: number | null;
   return <div><div><span>{label}</span><small>{optionalPercent(value)} / {percent(limit)}</small></div><div className="bar"><i style={{ width: `${width}%` }} /></div></div>;
 }
 
-function PortfolioView({ portfolio, teamPortfolios, brokerOrders, mode }: { portfolio: Portfolio; teamPortfolios: TeamPortfolios; brokerOrders: BrokerOrder[]; mode: Overview["mode"] }) {
+function PortfolioView({ portfolio, teamPortfolios, brokerOrders, mode, request, refresh }: { portfolio: Portfolio; teamPortfolios: TeamPortfolios; brokerOrders: BrokerOrder[]; mode: Overview["mode"]; request: Request; refresh: () => void }) {
   const teams = teamPortfolios.teams;
+  const [tradingRuns, setTradingRuns] = useState<TeamTradingRun[]>([]);
+  const [busyTeamId, setBusyTeamId] = useState<string | null>(null);
+  const [tradingError, setTradingError] = useState<string | null>(null);
+  const runStatuses = useRef(new Map<string, TeamTradingRun["status"]>());
+  const loadTradingRuns = useCallback(async () => {
+    try {
+      const runs = await request<TeamTradingRun[]>("/finance-teams/trading");
+      const finished = runs.some((run) => run.status !== "RUNNING" && run.status !== "IDLE"
+        && (!runStatuses.current.has(run.teamId) || runStatuses.current.get(run.teamId) === "RUNNING"));
+      runStatuses.current = new Map(runs.map((run) => [run.teamId, run.status]));
+      setTradingRuns(runs);
+      setTradingError(null);
+      // Start returns during research; refresh on completion, including after tab navigation.
+      if (finished) refresh();
+    } catch (reason) {
+      setTradingError(reason instanceof Error ? reason.message : String(reason));
+    }
+  }, [request, refresh]);
+
+  useEffect(() => {
+    void loadTradingRuns();
+    const timer = window.setInterval(() => void loadTradingRuns(), 2500);
+    return () => window.clearInterval(timer);
+  }, [loadTradingRuns]);
+
+  const setTeamTrading = async (teamId: string, action: "start" | "stop") => {
+    setBusyTeamId(teamId);
+    try {
+      const state = await request<TeamTradingRun>(`/finance-teams/${encodeURIComponent(teamId)}/trading/${action}`, { method: "POST" });
+      runStatuses.current.set(teamId, state.status);
+      setTradingRuns((current) => [...current.filter((entry) => entry.teamId !== teamId), state]);
+      setTradingError(null);
+      refresh();
+    } catch (reason) {
+      setTradingError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusyTeamId(null);
+    }
+  };
+
   return <div className="view-stack">
     <div className="section-heading"><div><span className="eyebrow">PAPER PORTFOLIO</span><h2>{portfolio.name}</h2></div><span className="mode-label"><ShieldCheck size={14} /> {MODE_LABEL[mode]}</span></div>
     <div className="metric-strip four"><Metric label="Total value" value={money(portfolio.totalValue, portfolio.currency)} detail={portfolio.currency} /><Metric label="Cash reserve" value={money(portfolio.cash, portfolio.currency)} detail={percent(portfolio.cash / portfolio.totalValue)} /><Metric label="Gross exposure" value={money(portfolio.grossExposure, portfolio.currency)} detail={percent(portfolio.grossExposure / portfolio.totalValue)} /><Metric label="Max drawdown" value={optionalPercent(portfolio.drawdown)} detail={`${portfolio.performance.observations} valuation points`} tone={tone(portfolio.drawdown ?? 0)} /></div>
@@ -233,20 +276,28 @@ function PortfolioView({ portfolio, teamPortfolios, brokerOrders, mode }: { port
     <div className="analytics-grid"><Analytic label="Annualized return" value={optionalPercent(portfolio.performance.annualizedReturn)} /><Analytic label="Volatility" value={optionalPercent(portfolio.performance.volatility)} /><Analytic label="Sharpe ratio" value={optionalNumber(portfolio.performance.sharpe)} /><Analytic label="Sortino ratio" value={optionalNumber(portfolio.performance.sortino)} /></div>
 
     <div className="section-heading"><div><span className="eyebrow">TEAM PORTFOLIOS</span><h2>{teams.length} of 5 team portfolios</h2><p>Every finance team runs its own paper portfolio. Creating a team opens one, and the combined section below rolls all of them up.</p></div></div>
+    {tradingError && <div className="error-banner"><span>{tradingError}</span><button title="Dismiss" onClick={() => setTradingError(null)}><X size={15} /></button></div>}
     {teams.length
-      ? <>{teams.map((entry) => <TeamPortfolioPanel key={entry.teamId} entry={entry} brokerOrders={brokerOrders.filter((order) => order.portfolioId === entry.portfolio.id && order.status === "WORKING")} />)}<TeamPortfolioTotalPanel total={teamPortfolios.total} /></>
+      ? <>{teams.map((entry) => <TeamPortfolioPanel key={entry.teamId} entry={entry} brokerOrders={brokerOrders.filter((order) => order.portfolioId === entry.portfolio.id && order.status === "WORKING")} tradingRun={tradingRuns.find((run) => run.teamId === entry.teamId)} busy={busyTeamId === entry.teamId} onTradingAction={(action) => void setTeamTrading(entry.teamId, action)} />)}<TeamPortfolioTotalPanel total={teamPortfolios.total} /></>
       : <Empty text="No finance teams yet. Create a team in the Agents tab and its paper portfolio appears here." />}
   </div>;
 }
 
-function TeamPortfolioPanel({ entry, brokerOrders }: { entry: TeamPortfolio; brokerOrders: BrokerOrder[] }) {
+function TeamPortfolioPanel({ entry, brokerOrders, tradingRun, busy, onTradingAction }: { entry: TeamPortfolio; brokerOrders: BrokerOrder[]; tradingRun?: TeamTradingRun; busy: boolean; onTradingAction: (action: "start" | "stop") => void }) {
   const portfolio = entry.portfolio;
+  const running = tradingRun?.status === "RUNNING";
+  // The coordinator stops between agent turns, so the run stays RUNNING until the aborted turn
+  // unwinds. Without this the button keeps offering "Stop trading" and a stop looks ignored.
+  const stopping = running && tradingRun?.phase === "STOPPING";
   return <Panel
     title={`${entry.teamName} portfolio`}
     icon={<Users size={16} />}
-    action={<span className="portfolio-total">{money(portfolio.totalValue, portfolio.currency)}</span>}
+    action={<div className="team-portfolio-actions"><span className="portfolio-total">{money(portfolio.totalValue, portfolio.currency)}</span><button className={`button small${running ? "" : " primary"}`} disabled={busy || stopping || (!running && tradingRun?.available === false)} onClick={() => onTradingAction(running ? "stop" : "start")}>{busy || stopping ? <LoaderCircle size={13} className="spin" /> : running ? <Square size={12} /> : <Play size={13} />}{stopping ? "Stopping" : running ? "Stop trading" : "Start trading"}</button></div>}
   >
     <TeamRoster members={entry.members} />
+    <div className={`team-trading-state state-${(tradingRun?.status ?? "IDLE").toLowerCase()}`}><span><i />{formatTradingPhase(tradingRun?.phase ?? "IDLE")}</span><small>{tradingRun?.message ?? "Ready for an autonomous paper-trading cycle."}</small></div>
+    {/* The status message is deliberately generic, so the run's own failure text is the only place the operator can see which agent turn broke and why. */}
+    {tradingRun?.error && <p className="team-trading-error">{formatTradingError(tradingRun.error)}</p>}
     <div className="metric-strip four"><Metric label="Total value" value={money(portfolio.totalValue, portfolio.currency)} detail={`${money(portfolio.cash, portfolio.currency)} cash`} /><Metric label="Daily change" value={signedMoney(portfolio.dailyPnl, portfolio.currency)} detail={percent(portfolio.dailyReturn)} tone={tone(portfolio.dailyPnl)} /><Metric label="Total return" value={optionalPercent(portfolio.totalReturn)} detail={portfolio.initialCash === null ? "Baseline pending" : `${money(portfolio.initialCash, portfolio.currency)} funded`} tone={tone(portfolio.totalReturn ?? 0)} /><Metric label="Gross exposure" value={money(portfolio.grossExposure, portfolio.currency)} detail={percent(portfolio.grossExposure / (portfolio.totalValue || 1))} /></div>
     {brokerOrders.length > 0 && <div className="portfolio-order-block"><span className="eyebrow">WORKING BROKER ORDERS</span><BrokerOrderTable orders={brokerOrders} teams={[]} compact /></div>}
     <PositionTable positions={portfolio.positions} currency={portfolio.currency} compact />
@@ -552,4 +603,16 @@ function optionalNumber(value: number | null | undefined) { return value === nul
 function number(value: number) { return new Intl.NumberFormat("en-US", { maximumFractionDigits: 6 }).format(value); }
 function shortDate(value: string) { return new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric", year: "numeric" }).format(new Date(value)); }
 function relative(value: string) { const ms = Date.now() - new Date(value).getTime(); const minutes = Math.floor(ms / 60000); if (minutes < 1) return "just now"; if (minutes < 60) return `${minutes}m ago`; const hours = Math.floor(minutes / 60); if (hours < 24) return `${hours}h ago`; return `${Math.floor(hours / 24)}d ago`; }
+// Agent-runtime failures arrive as the provider's raw JSON error envelope, so unwrap it to the
+// human sentence; anything else is shown verbatim rather than hidden behind a parse failure.
+function formatTradingError(value: string) {
+  try {
+    const parsed: unknown = JSON.parse(value);
+    const message = (parsed as { error?: { message?: unknown }; message?: unknown })?.error?.message
+      ?? (parsed as { message?: unknown })?.message;
+    if (typeof message === "string" && message.trim()) return message;
+  } catch { /* not JSON — fall through to the raw text */ }
+  return value;
+}
+function formatTradingPhase(value: string) { return value.toLowerCase().replaceAll("_", " ").replace(/(^|\s)\S/g, (letter) => letter.toUpperCase()); }
 function tone(value: number): "positive" | "negative" | "neutral" { return value > 0 ? "positive" : value < 0 ? "negative" : "neutral"; }
