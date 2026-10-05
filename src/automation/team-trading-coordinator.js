@@ -1,12 +1,18 @@
 import { FinanceError } from "../api/validation.js";
 import { OPERATOR_ACTOR, createActor } from "../service/finance-lab.js";
+import { scoreLesson } from "../evaluation/lesson-scoring.js";
 
 const RUN_TIMEOUT_MS = 5 * 60_000;
+// Post-mortems run before research, so this caps the latency added to a single cycle;
+// any remaining graded decisions are reviewed by the following cycles.
+const MAX_REFLECTIONS_PER_CYCLE = 3;
+const LESSON_FIELDS = ["trigger", "betterApproach", "avoid", "verify"];
 
 export class TeamTradingCoordinator {
-  constructor({ service, agentRuntime, logger = console, timeoutMs = RUN_TIMEOUT_MS }) {
+  constructor({ service, agentRuntime, memory, logger = console, timeoutMs = RUN_TIMEOUT_MS }) {
     this.service = service;
     this.agentRuntime = agentRuntime ?? null;
+    this.memory = memory ?? null;
     this.logger = logger;
     this.timeoutMs = timeoutMs;
     this.states = new Map();
@@ -83,6 +89,24 @@ export class TeamTradingCoordinator {
     return this.get(team.id);
   }
 
+  lessons(teamId) {
+    const team = this.#team(teamId);
+    const decisions = this.service.store.listGradedDecisions(team.portfolioId);
+    return this.service.store.listTeamLessons(team.portfolioId, { limit: 200, includeRetired: true })
+      .map((lesson) => ({ ...lesson, score: scoreLesson(lesson, decisions) }));
+  }
+
+  async retireLesson(teamId, lessonId) {
+    const team = this.#team(teamId);
+    const lesson = this.service.store.getTeamLesson(lessonId);
+    if (!lesson || lesson.portfolioId !== team.portfolioId) {
+      throw new FinanceError("Team lesson not found", { code: "FINANCE_TEAM_LESSON_NOT_FOUND", status: 404 });
+    }
+    this.service.store.retireTeamLesson(lesson.id, "Retired by the operator.");
+    await this.#syncLessonMemory(team);
+    return this.lessons(team.id).find((entry) => entry.id === lesson.id);
+  }
+
   async waitForTeam(teamId) {
     await this.running.get(teamId);
     return this.get(teamId);
@@ -95,6 +119,13 @@ export class TeamTradingCoordinator {
 
   async #run(team, roles, control) {
     const actors = roleActors(roles);
+    await this.#reflect(team, roles, control);
+    this.#retireIneffectiveLessons(team);
+    await this.#syncLessonMemory(team);
+    this.#set(team, roles, {
+      phase: "RESEARCHING",
+      message: `${roles.researcher.displayName} is researching a paper-trade opportunity.`,
+    });
     const context = await this.#context(team);
     const research = await this.#turn(team, roles, control, {
       agent: roles.researcher,
@@ -151,6 +182,8 @@ export class TeamTradingCoordinator {
       thesis: decision.thesis,
       evidence: decision.evidence,
     });
+    await this.#recordForecast(actors.trader, proposal, decision);
+    this.service.store.recordProposalLessons(proposal.id, context.lessons.map((lesson) => lesson.id));
 
     this.#set(team, roles, {
       phase: "REVIEWING",
@@ -290,7 +323,109 @@ export class TeamTradingCoordinator {
       },
       risk: this.service.riskEngine.state(portfolio),
       execution: this.service.ibkrBroker ? `ibkr-paper-${this.service.ibkrExecution}` : "local-paper",
+      lessons: this.service.store.listTeamLessons(team.portfolioId),
     };
+  }
+
+  // The forecast is what later grades this decision, whether the lead approves or rejects
+  // the draft. Learning is secondary to trading: a malformed forecast never blocks the order.
+  async #recordForecast(trader, proposal, decision) {
+    try {
+      const prediction = await this.service.recordPrediction(trader, {
+        symbol: proposal.symbol,
+        direction: proposal.side === "BUY" ? "BULLISH" : "BEARISH",
+        expectedReturnMin: decision.expectedReturnMin,
+        expectedReturnMax: decision.expectedReturnMax,
+        horizonDays: decision.horizonDays,
+        confidence: decision.confidence,
+        thesis: proposal.thesis || `${proposal.side} ${proposal.symbol}`,
+        invalidationConditions: typeof decision.invalidation === "string" ? [decision.invalidation] : decision.invalidation,
+        evidence: decision.evidence,
+      });
+      this.service.store.linkProposalPrediction(proposal.id, prediction.id);
+    } catch (error) {
+      this.logger.warn?.(`[finance-lab] proposal ${proposal.id} has no gradeable forecast: ${error.message}`);
+    }
+  }
+
+  // Post-mortem on decisions whose forecasts have been graded. Only mistakes get a lead
+  // turn; a correct decision is marked reviewed without spending a model call.
+  async #reflect(team, roles, control) {
+    const graded = this.service.store.listUnreflectedGradedProposals(team.portfolioId, {
+      limit: MAX_REFLECTIONS_PER_CYCLE,
+    });
+    for (const proposal of graded) {
+      this.#assertRunning(control);
+      const reviewed = { proposalId: proposal.id, authorAgentId: roles.lead.agentId };
+      if (!isDecisionMistake(proposal)) {
+        this.service.store.recordProposalReflection(reviewed);
+        continue;
+      }
+      this.#set(team, roles, {
+        phase: "REFLECTING",
+        message: `${roles.lead.displayName} is reviewing the graded ${proposal.symbol} decision.`,
+      });
+      let text;
+      try {
+        text = await this.#turn(team, roles, control, {
+          agent: roles.lead,
+          scope: `team-${team.id}-reflection`,
+          label: `Finance · ${team.name} · Reflection`,
+          message: reflectionPrompt(team, roles, proposal),
+        });
+      } catch (error) {
+        if (control.stopped) throw error;
+        // A failed turn (timeout, unavailable model) leaves the decision for the next cycle.
+        this.logger.warn?.(`[finance-lab] reflection on ${proposal.id} deferred: ${error.message}`);
+        continue;
+      }
+      let lesson = null;
+      try {
+        lesson = parseLesson(text);
+      } catch (error) {
+        // A protocol failure is final for this decision; retrying it would stall the queue.
+        this.logger.warn?.(`[finance-lab] reflection on ${proposal.id} produced no lesson: ${error.message}`);
+      }
+      this.service.store.recordProposalReflection({ ...reviewed, lesson });
+    }
+  }
+
+  #retireIneffectiveLessons(team) {
+    const decisions = this.service.store.listGradedDecisions(team.portfolioId);
+    for (const lesson of this.service.store.listTeamLessons(team.portfolioId, { limit: 200 })) {
+      const score = scoreLesson(lesson, decisions);
+      if (score.verdict !== "NOT_HELPING") continue;
+      this.service.store.retireTeamLesson(
+        lesson.id,
+        `Correct on ${score.correct} of ${score.trials} decisions it was shown on (${pct(score.correctRate)}), versus ${pct(score.baselineRate)} without it.`,
+      );
+    }
+  }
+
+  // Shared memory is a mirror for ORION's second brain; Finance SQLite stays the source of
+  // truth. An unavailable vault leaves lessons unsynced and the next cycle retries them.
+  async #syncLessonMemory(team) {
+    if (!this.memory) return;
+    for (const lesson of this.service.store.listLessonsNeedingMemorySync(team.portfolioId)) {
+      try {
+        if (lesson.retiredAt) {
+          await this.memory.removeSharedLesson({ key: lessonMemoryKey(lesson) });
+          this.service.store.setLessonMemorySynced(lesson.id, false);
+        } else {
+          await this.memory.upsertSharedLesson({
+            key: lessonMemoryKey(lesson),
+            title: `Finance · ${team.name}: ${lesson.trigger}`.slice(0, 120),
+            body: `Trigger: ${lesson.trigger}\n\nBetter approach: ${lesson.betterApproach}\n\nAvoid: ${lesson.avoid}\n\nVerify: ${lesson.verify}`,
+            authorAgentId: lesson.authorAgentId,
+            tags: ["finance", "trading"],
+          });
+          this.service.store.setLessonMemorySynced(lesson.id, true);
+        }
+      } catch (error) {
+        this.logger.warn?.(`[finance-lab] lesson ${lesson.id} memory sync deferred: ${error.message}`);
+        return;
+      }
+    }
   }
 
   async #turn(team, roles, control, { agent, scope, label, message }) {
@@ -429,15 +564,20 @@ function idleState(team, available) {
 }
 
 function cycleContext(team, roles, context) {
+  const { lessons, ...state } = context;
   return [
     `Team roles: ${JSON.stringify(team.members.map(({ displayName, role, lead }) => ({ displayName, role, lead })))}`,
-    `Current paper portfolio, risk limits, and execution mode: ${JSON.stringify(context)}`,
+    `Current paper portfolio, risk limits, and execution mode: ${JSON.stringify(state)}`,
+    lessons.length > 0 && [
+      "Lessons from this team's graded past decisions. Apply one where its trigger matches; lessons never override current evidence or hard risk limits:",
+      ...lessons.map((lesson) => `- When ${lesson.trigger}: ${lesson.betterApproach} Avoid: ${lesson.avoid} Verify: ${lesson.verify}`),
+    ].join("\n"),
     "Supported orders are cash-funded BUY of permitted equities/ETFs and SELL of an existing held position. SELL cannot open a short. Options, margin shorts, and atomic paired orders are not supported. Do not recommend unsupported instruments as executable trades.",
     "Team disposition is an analytical lens, not an extra execution veto. A neutral disposition can choose either direction without a permanent bias; do not invent a requirement for a beta-neutral pair unless the lead explicitly sets that mandate. A bearish disposition prioritizes downside evidence and defensive opportunities rather than requiring a short in every cycle. Preserve the lead's actual mandate.",
     "Seek a positive expected risk/reward with a defined horizon and invalidation condition, not certainty or absence of counterarguments. Express uncertainty through a smaller paper position within existing limits. Never force a trade if evidence is insufficient or hard risk limits block it.",
     `Stage ownership: ${roles.researcher.displayName} researches; ${roles.lead.displayName} sets strategy; ${roles.trader.displayName} drafts; the lead approves the concrete proposal; that same trader submits. A draft does not require prior order approval.`,
     "The coordinator owns Finance Lab persistence, role enforcement, and final deterministic risk checks. Missing model-visible Finance tools are not a reason to stop; use available reliable research tools and the supplied portfolio context. Never ask the human to repeat approval for this authorized paper cycle.",
-  ].join("\n\n");
+  ].filter(Boolean).join("\n\n");
 }
 
 function researchPrompt(team, roles, context) {
@@ -467,7 +607,8 @@ function proposalPrompt(team, roles, research, strategy, context) {
     `Research handoff:\n${String(research ?? "No research text was returned.").slice(0, 20_000)}`,
     `Strategy from ${roles.lead.displayName}:\n${String(strategy ?? "No strategy text was returned.").slice(0, 20_000)}`,
     "Choose at most one justified, supported paper order. A small position can express a defensible but uncertain thesis. Check size against the supplied portfolio and policy. Return the structured decision below; do not call finance_create_trade_proposal, approve, or submit here. The coordinator creates this cycle's draft with your returned evidence before lead review. Do not reject a draft because it has not yet passed that next approval stage.",
-    'End with exactly one line: FINANCE_PROPOSAL: {"decision":"PROPOSE","symbol":"SYMBOL","side":"BUY","quantity":1,"thesis":"sources, catalyst, counterevidence, horizon, sizing and invalidation","evidence":[]}. Replace the example fields with your actual supported order; side is BUY or SELL and evidence contains verified source details.',
+    'End with exactly one line: FINANCE_PROPOSAL: {"decision":"PROPOSE","symbol":"SYMBOL","side":"BUY","quantity":1,"thesis":"sources, catalyst, counterevidence, horizon, sizing and invalidation","evidence":[],"horizonDays":20,"confidence":0.6,"expectedReturnMin":0.01,"expectedReturnMax":0.06,"invalidation":"condition that proves the thesis wrong"}. Replace the example fields with your actual supported order; side is BUY or SELL and evidence contains verified source details.',
+    "The forecast fields grade this decision later, whether or not the lead approves it: horizonDays is the holding horizon in days, confidence is your honest probability (0 to 1) that the price moves in the trade's direction over that horizon, and expectedReturnMin/Max bound the symbol's price return as decimals (negative for a SELL). Do not inflate confidence; it is scored against outcomes.",
     'If no supported candidate is justified, end with exactly one line: FINANCE_PROPOSAL: {"decision":"NO_TRADE","reason":"specific evidence or risk blocker, alternatives considered, and what would change the decision"}',
     "Paper trading only; never use a live account.",
   ].join("\n\n");
@@ -497,6 +638,52 @@ function submissionPrompt(team, roles, proposal) {
     "Deterministic risk checks and the paper broker remain authoritative. Do not reopen the strategy debate unless a material new fact invalidates the approved thesis.",
     "Never route to a live account. Report results accurately and do not retry an ambiguous broker submission.",
   ].join("\n\n");
+}
+
+function reflectionPrompt(team, roles, proposal) {
+  const { prediction } = proposal;
+  return [
+    `You are ${roles.lead.displayName}, rank 1 and team lead for ${team.name}. Before this cycle's research, review one graded past decision.`,
+    proposal.status === "REJECTED"
+      ? "The team did not take this trade, and its forecast came true."
+      : "The team took this trade, and the market moved against its forecast.",
+    `Decision: ${JSON.stringify({ symbol: proposal.symbol, side: proposal.side, status: proposal.status, thesis: proposal.thesis, decidedAt: proposal.createdAt })}`,
+    `Forecast and graded result: ${JSON.stringify({
+      confidence: prediction.confidence,
+      horizonDays: prediction.horizonDays,
+      expectedReturnMin: prediction.expectedReturnMin,
+      expectedReturnMax: prediction.expectedReturnMax,
+      invalidation: prediction.invalidationConditions,
+      actualReturn: prediction.result.actualReturn,
+      benchmarkReturn: prediction.result.benchmarkReturn,
+      alpha: prediction.result.alpha,
+    })}`,
+    "Name a repeatable process error if one caused this: missed counterevidence, overconfidence, an ignored invalidation, poor sizing or horizon, or an unjustified rejection. A single outcome can be noise. If the decision was sound given what was knowable, or a hard risk limit blocked it, return NONE rather than inventing a rule.",
+    'End with exactly one line: FINANCE_LESSON: {"trigger":"situation where this applies","betterApproach":"what to do instead","avoid":"the specific mistake","verify":"check that shows the lesson was applied"} or FINANCE_LESSON: {"lesson":"NONE","reason":"why there is no repeatable error"}',
+  ].join("\n\n");
+}
+
+// A taken trade is a mistake when the market moved against its forecast; a declined one
+// is a mistake when the forecast it passed on came true.
+function isDecisionMistake(proposal) {
+  return proposal.prediction.result.directionCorrect === (proposal.status === "REJECTED");
+}
+
+function lessonMemoryKey(lesson) {
+  return `lesson-${lesson.id}`;
+}
+
+function pct(value) {
+  return `${Math.round(value * 100)}%`;
+}
+
+function parseLesson(text) {
+  const lesson = parseDecision(text, "FINANCE_LESSON");
+  if (lesson.lesson === "NONE") return null;
+  if (!LESSON_FIELDS.every((field) => typeof lesson[field] === "string" && lesson[field].trim().length >= 3)) {
+    throw invalidDecision("A lesson needs trigger, betterApproach, avoid, and verify");
+  }
+  return Object.fromEntries(LESSON_FIELDS.map((field) => [field, lesson[field].trim().slice(0, 1000)]));
 }
 
 function roleActors(roles) {

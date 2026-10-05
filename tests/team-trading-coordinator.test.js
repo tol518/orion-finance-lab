@@ -502,3 +502,263 @@ for (const viaTool of [false, true]) {
   assert.equal(service.store.getProposal(state.proposalId).status, "REJECTED");
 });
 }
+
+const FORECAST = { horizonDays: 20, confidence: 0.7, expectedReturnMin: 0.01, expectedReturnMax: 0.08, invalidation: "Closes below 95." };
+
+function learningRuntime({ review = "APPROVE", reflection, onTurn = () => {} } = {}) {
+  return {
+    async runTurn(input) {
+      onTurn(input);
+      if (input.scope.endsWith("-reflection")) return reflection(input);
+      if (input.scope.endsWith("-research")) return "Recommend AAPL.";
+      if (input.scope.endsWith("-strategy")) return "Draft a small AAPL BUY.";
+      if (input.scope.endsWith("-proposal")) return `FINANCE_PROPOSAL: ${JSON.stringify({ decision: "PROPOSE", symbol: "AAPL", side: "BUY", quantity: 1, thesis: "Momentum continuation.", ...FORECAST })}`;
+      if (input.scope.endsWith("-approval")) return `FINANCE_REVIEW: {"decision":"${review}","reason":"Synthetic review."}`;
+      return 'FINANCE_SUBMISSION: {"decision":"SUBMIT"}';
+    },
+    async abortTurn() {},
+  };
+}
+
+async function runCycle(coordinator, team) {
+  coordinator.start(team.id);
+  return coordinator.waitForTeam(team.id);
+}
+
+function gradeProposal(service, proposalId, { directionCorrect }) {
+  const proposal = service.store.getProposal(proposalId);
+  service.store.recordPredictionResult({
+    predictionId: proposal.predictionId,
+    endPrice: directionCorrect ? 105 : 92,
+    actualReturn: directionCorrect ? 0.05 : -0.08,
+    benchmarkReturn: 0.01,
+    alpha: directionCorrect ? 0.04 : -0.09,
+    directionCorrect,
+    rangeCorrect: directionCorrect,
+  });
+}
+
+test("a losing approved trade becomes a lesson that later cycles receive before research", async (t) => {
+  const { service, team } = await setup();
+  t.after(() => service.close());
+  const turns = [];
+  const runtime = learningRuntime({
+    onTurn: (input) => turns.push(input),
+    reflection: () => 'FINANCE_LESSON: {"trigger":"momentum entries into earnings week","betterApproach":"Wait for the print or halve size.","avoid":"Full-size entries before binary events.","verify":"Thesis names the next earnings date."}',
+  });
+  const coordinator = new TeamTradingCoordinator({ service, agentRuntime: runtime });
+
+  const first = await runCycle(coordinator, team);
+  const prediction = service.store.getPrediction(service.store.getProposal(first.proposalId).predictionId);
+  assert.equal(prediction.agentId, "trader-agent");
+  assert.equal(prediction.direction, "BULLISH");
+  assert.equal(prediction.confidence, 0.7);
+  assert.deepEqual(prediction.invalidationConditions, ["Closes below 95."]);
+
+  gradeProposal(service, first.proposalId, { directionCorrect: false });
+  turns.length = 0;
+  await runCycle(coordinator, team);
+
+  assert.deepEqual(turns.slice(0, 2).map((turn) => turn.scope.split("-").at(-1)), ["reflection", "research"]);
+  assert.equal(turns[0].agentId, "lead-agent");
+  assert.match(turns[0].message, /market moved against its forecast/);
+  assert.match(turns[0].message, /"actualReturn":-0.08/);
+  const lessons = service.store.listTeamLessons(team.portfolioId);
+  assert.equal(lessons.length, 1);
+  assert.equal(lessons[0].proposalId, first.proposalId);
+  for (const turn of turns.slice(1, 4)) assert.match(turn.message, /When momentum entries into earnings week: Wait for the print/);
+
+  turns.length = 0;
+  await runCycle(coordinator, team);
+  assert.equal(turns.some((turn) => turn.scope.endsWith("-reflection")), false);
+  assert.equal(service.store.listTeamLessons(team.portfolioId).length, 1);
+});
+
+test("a correct decision is marked reviewed without spending a reflection turn", async (t) => {
+  const { service, team } = await setup();
+  t.after(() => service.close());
+  const runtime = learningRuntime({ reflection: () => assert.fail("Correct decisions must not trigger reflection") });
+  const coordinator = new TeamTradingCoordinator({ service, agentRuntime: runtime });
+
+  const first = await runCycle(coordinator, team);
+  gradeProposal(service, first.proposalId, { directionCorrect: true });
+  await runCycle(coordinator, team);
+
+  assert.equal(service.store.listUnreflectedGradedProposals(team.portfolioId).length, 0);
+  assert.equal(service.store.listTeamLessons(team.portfolioId).length, 0);
+});
+
+test("a rejected trade whose forecast came true is reviewed as a missed opportunity", async (t) => {
+  const { service, team } = await setup();
+  t.after(() => service.close());
+  const prompts = [];
+  const runtime = learningRuntime({
+    review: "REJECT",
+    reflection: (input) => {
+      prompts.push(input.message);
+      return 'FINANCE_LESSON: {"lesson":"NONE","reason":"The rejection was reasonable given the evidence."}';
+    },
+  });
+  const coordinator = new TeamTradingCoordinator({ service, agentRuntime: runtime });
+
+  const first = await runCycle(coordinator, team);
+  assert.equal(first.phase, "REJECTED");
+  gradeProposal(service, first.proposalId, { directionCorrect: true });
+  await runCycle(coordinator, team);
+
+  assert.equal(prompts.length, 1);
+  assert.match(prompts[0], /did not take this trade, and its forecast came true/);
+  assert.equal(service.store.listTeamLessons(team.portfolioId).length, 0);
+  assert.equal(service.store.listUnreflectedGradedProposals(team.portfolioId).length, 0);
+});
+
+test("a failed reflection turn is retried later and never blocks trading", async (t) => {
+  const { service, team } = await setup();
+  t.after(() => service.close());
+  let fail = true;
+  const runtime = learningRuntime({
+    reflection: () => {
+      if (fail) throw new Error("model unavailable");
+      return 'FINANCE_LESSON: {"trigger":"t1 setup","betterApproach":"b1 approach","avoid":"a1 mistake","verify":"v1 check"}';
+    },
+  });
+  const coordinator = new TeamTradingCoordinator({ service, agentRuntime: runtime });
+
+  const first = await runCycle(coordinator, team);
+  gradeProposal(service, first.proposalId, { directionCorrect: false });
+  const second = await runCycle(coordinator, team);
+  assert.equal(second.status, "COMPLETED");
+  assert.equal(service.store.listUnreflectedGradedProposals(team.portfolioId).length, 1);
+
+  fail = false;
+  await runCycle(coordinator, team);
+  assert.equal(service.store.listTeamLessons(team.portfolioId).length, 1);
+});
+
+test("a proposal without a valid forecast still trades but is never graded", async (t) => {
+  const { service, team } = await setup();
+  t.after(() => service.close());
+  const warnings = [];
+  const runtime = learningRuntime({ reflection: () => assert.fail("Ungraded proposals must not be reflected") });
+  const original = runtime.runTurn;
+  runtime.runTurn = async (input) => input.scope.endsWith("-proposal")
+    ? 'FINANCE_PROPOSAL: {"decision":"PROPOSE","symbol":"AAPL","side":"BUY","quantity":1,"thesis":"No forecast."}'
+    : original(input);
+  const coordinator = new TeamTradingCoordinator({ service, agentRuntime: runtime, logger: { warn: (message) => warnings.push(message), error() {} } });
+
+  const state = await runCycle(coordinator, team);
+
+  assert.equal(state.phase, "COMPLETED");
+  assert.equal(service.store.getProposal(state.proposalId).predictionId, null);
+  assert.match(warnings[0], /no gradeable forecast/);
+});
+
+function seedLesson(service, team, trigger = "seeded trigger") {
+  const source = service.store.createProposal({ portfolioId: team.portfolioId, agentId: "trader-agent", symbol: "AAPL", side: "BUY", quantity: 1, thesis: "Seed." });
+  service.store.recordProposalReflection({
+    proposalId: source.id,
+    authorAgentId: "lead-agent",
+    lesson: { trigger, betterApproach: "Better approach.", avoid: "Avoid this.", verify: "Verify that." },
+  });
+  return service.store.listTeamLessons(team.portfolioId, { limit: 50 }).find((lesson) => lesson.proposalId === source.id);
+}
+
+function seedGradedDecision(service, team, { correct, lessonIds = [] }) {
+  const proposal = service.store.createProposal({ portfolioId: team.portfolioId, agentId: "trader-agent", symbol: "AAPL", side: "BUY", quantity: 1, thesis: "Seeded decision." });
+  service.store.db.prepare("UPDATE trade_proposals SET status = 'APPROVED', reflected_at = ? WHERE id = ?").run(new Date().toISOString(), proposal.id);
+  const prediction = service.store.recordPrediction({ agentId: "trader-agent", symbol: "AAPL", direction: "BULLISH", expectedReturnMin: 0, expectedReturnMax: 0.1, horizonDays: 5, confidence: 0.6, thesis: "Seed.", invalidationConditions: [], benchmarkSymbol: "^GSPC", startPrice: 100 });
+  service.store.linkProposalPrediction(proposal.id, prediction.id);
+  service.store.recordPredictionResult({ predictionId: prediction.id, endPrice: correct ? 105 : 95, actualReturn: correct ? 0.05 : -0.05, directionCorrect: correct, rangeCorrect: correct });
+  service.store.recordProposalLessons(proposal.id, lessonIds);
+}
+
+function fakeMemory({ failUpserts = 0 } = {}) {
+  const calls = [];
+  return {
+    calls,
+    async upsertSharedLesson(input) {
+      if (failUpserts-- > 0) throw new Error("vault unavailable");
+      calls.push(["upsert", input]);
+      return { id: "note" };
+    },
+    async removeSharedLesson(input) {
+      calls.push(["remove", input]);
+      return true;
+    },
+  };
+}
+
+test("each proposal records which lessons its cycle was shown", async (t) => {
+  const { service, team } = await setup();
+  t.after(() => service.close());
+  const lesson = seedLesson(service, team);
+  const coordinator = new TeamTradingCoordinator({ service, agentRuntime: learningRuntime({ reflection: () => assert.fail("No graded decisions") }) });
+
+  const state = await runCycle(coordinator, team);
+  gradeProposal(service, state.proposalId, { directionCorrect: true });
+
+  const graded = service.store.listGradedDecisions(team.portfolioId).find((entry) => entry.proposalId === state.proposalId);
+  assert.deepEqual(graded.lessonIds, [lesson.id]);
+});
+
+test("a lesson that does not beat the team's baseline is retired, dropped from prompts, and removed from memory", async (t) => {
+  const { service, team } = await setup();
+  t.after(() => service.close());
+  const lesson = seedLesson(service, team, "earnings-week momentum");
+  for (let index = 0; index < 4; index += 1) seedGradedDecision(service, team, { correct: true });
+  for (let index = 0; index < 6; index += 1) seedGradedDecision(service, team, { correct: index < 2, lessonIds: [lesson.id] });
+  service.store.setLessonMemorySynced(lesson.id, true);
+  const memory = fakeMemory();
+  const turns = [];
+  const coordinator = new TeamTradingCoordinator({ service, memory, agentRuntime: learningRuntime({ onTurn: (input) => turns.push(input), reflection: () => assert.fail("Seeded decisions are already reviewed") }) });
+
+  await runCycle(coordinator, team);
+
+  const [scored] = coordinator.lessons(team.id).filter((entry) => entry.id === lesson.id);
+  assert.ok(scored.retiredAt);
+  assert.match(scored.retiredReason, /Correct on 2 of 6 decisions .* \(33%\), versus 100% without it/);
+  assert.equal(scored.score.verdict, "NOT_HELPING");
+  assert.equal(scored.memorySynced, false);
+  assert.deepEqual(memory.calls, [["remove", { key: `lesson-${lesson.id}` }]]);
+  assert.equal(turns.some((turn) => turn.message.includes("earnings-week momentum")), false);
+});
+
+test("new lessons are mirrored into shared memory and retried after a vault failure", async (t) => {
+  const { service, team } = await setup();
+  t.after(() => service.close());
+  const lesson = seedLesson(service, team, "thin pre-market volume");
+  const memory = fakeMemory({ failUpserts: 1 });
+  const coordinator = new TeamTradingCoordinator({ service, memory, logger: { warn() {}, error() {} }, agentRuntime: learningRuntime({ reflection: () => "" }) });
+
+  await runCycle(coordinator, team);
+  assert.equal(service.store.getTeamLesson(lesson.id).memorySynced, false);
+
+  await runCycle(coordinator, team);
+  assert.equal(service.store.getTeamLesson(lesson.id).memorySynced, true);
+  const [, input] = memory.calls[0];
+  assert.equal(input.key, `lesson-${lesson.id}`);
+  assert.equal(input.authorAgentId, "lead-agent");
+  assert.equal(input.title, "Finance · Dynamic Test Team: thin pre-market volume");
+  assert.equal(input.body, "Trigger: thin pre-market volume\n\nBetter approach: Better approach.\n\nAvoid: Avoid this.\n\nVerify: Verify that.");
+
+  await runCycle(coordinator, team);
+  assert.equal(memory.calls.length, 1);
+});
+
+test("the operator can retire a team's lesson but not another team's", async (t) => {
+  const { service, team } = await setup();
+  t.after(() => service.close());
+  const lesson = seedLesson(service, team);
+  service.store.setLessonMemorySynced(lesson.id, true);
+  const memory = fakeMemory();
+  const coordinator = new TeamTradingCoordinator({ service, memory, agentRuntime: learningRuntime({ reflection: () => "" }) });
+
+  const retired = await coordinator.retireLesson(team.id, lesson.id);
+  assert.equal(retired.retiredReason, "Retired by the operator.");
+  assert.deepEqual(memory.calls, [["remove", { key: `lesson-${lesson.id}` }]]);
+  assert.equal(service.store.listTeamLessons(team.portfolioId).length, 0);
+
+  await service.assignFinanceAgent(OPERATOR_ACTOR, { agentId: "other-lead", displayName: "Other", role: "Finance Team Lead" });
+  const other = await service.createFinanceTeam(OPERATOR_ACTOR, { name: "Other Team", agentIds: ["other-lead"] });
+  await assert.rejects(coordinator.retireLesson(other.id, lesson.id), (error) => error.code === "FINANCE_TEAM_LESSON_NOT_FOUND");
+});

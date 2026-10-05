@@ -6,6 +6,7 @@ import {
   BarChart3,
   BookOpenCheck,
   Bot,
+  Brain,
   CheckCircle2,
   ChevronRight,
   CircleDollarSign,
@@ -46,6 +47,7 @@ import type {
   TeamPortfolio,
   TeamPortfolios,
   TeamPortfolioTotal,
+  TeamLesson,
   TeamTradingRun,
   Trade,
 } from "./types";
@@ -285,12 +287,12 @@ function PortfolioView({ portfolio, teamPortfolios, brokerOrders, mode, request,
     <div className="section-heading"><div><span className="eyebrow">TEAM PORTFOLIOS</span><h2>{teams.length} of 5 team portfolios</h2><p>Every finance team runs its own paper portfolio. Creating a team opens one, and the combined section below rolls all of them up.</p></div></div>
     {tradingError && <div className="error-banner"><span>{tradingError}</span><button title="Dismiss" onClick={() => setTradingError(null)}><X size={15} /></button></div>}
     {teams.length
-      ? <>{teams.map((entry) => <TeamPortfolioPanel key={entry.teamId} entry={entry} brokerOrders={brokerOrders.filter((order) => order.portfolioId === entry.portfolio.id && order.status === "WORKING")} tradingRun={tradingRuns.find((run) => run.teamId === entry.teamId)} busy={busyTeamId === entry.teamId} onTradingAction={(action) => void setTeamTrading(entry.teamId, action)} />)}<TeamPortfolioTotalPanel total={teamPortfolios.total} /></>
+      ? <>{teams.map((entry) => <TeamPortfolioPanel key={entry.teamId} entry={entry} request={request} brokerOrders={brokerOrders.filter((order) => order.portfolioId === entry.portfolio.id && order.status === "WORKING")} tradingRun={tradingRuns.find((run) => run.teamId === entry.teamId)} busy={busyTeamId === entry.teamId} onTradingAction={(action) => void setTeamTrading(entry.teamId, action)} />)}<TeamPortfolioTotalPanel total={teamPortfolios.total} /></>
       : <Empty text="No finance teams yet. Create a team in the Agents tab and its paper portfolio appears here." />}
   </div>;
 }
 
-function TeamPortfolioPanel({ entry, brokerOrders, tradingRun, busy, onTradingAction }: { entry: TeamPortfolio; brokerOrders: BrokerOrder[]; tradingRun?: TeamTradingRun; busy: boolean; onTradingAction: (action: "start" | "stop") => void }) {
+function TeamPortfolioPanel({ entry, request, brokerOrders, tradingRun, busy, onTradingAction }: { entry: TeamPortfolio; request: Request; brokerOrders: BrokerOrder[]; tradingRun?: TeamTradingRun; busy: boolean; onTradingAction: (action: "start" | "stop") => void }) {
   const portfolio = entry.portfolio;
   const running = tradingRun?.status === "RUNNING";
   // The coordinator stops between agent turns, so the run stays RUNNING until the aborted turn
@@ -308,7 +310,75 @@ function TeamPortfolioPanel({ entry, brokerOrders, tradingRun, busy, onTradingAc
     <div className="metric-strip four"><Metric label="Total value" value={money(portfolio.totalValue, portfolio.currency)} detail={`${money(portfolio.cash, portfolio.currency)} cash`} /><Metric label="Daily change" value={signedMoney(portfolio.dailyPnl, portfolio.currency)} detail={percent(portfolio.dailyReturn)} tone={tone(portfolio.dailyPnl)} /><Metric label="Total return" value={optionalPercent(portfolio.totalReturn)} detail={portfolio.initialCash === null ? "Baseline pending" : `${money(portfolio.initialCash, portfolio.currency)} funded`} tone={tone(portfolio.totalReturn ?? 0)} /><Metric label="Gross exposure" value={money(portfolio.grossExposure, portfolio.currency)} detail={percent(portfolio.grossExposure / (portfolio.totalValue || 1))} /></div>
     {brokerOrders.length > 0 && <div className="portfolio-order-block"><span className="eyebrow">WORKING BROKER ORDERS</span><BrokerOrderTable orders={brokerOrders} teams={[]} compact /></div>}
     <PositionTable positions={portfolio.positions} currency={portfolio.currency} compact />
+    <TeamLessons teamId={entry.teamId} request={request} refreshKey={tradingRun?.completedAt ?? null} />
   </Panel>;
+}
+
+const LESSON_VERDICT: Record<TeamLesson["score"]["verdict"], string> = {
+  LEARNING: "Gathering evidence",
+  HELPING: "Helping",
+  NOT_HELPING: "Not helping",
+};
+
+// Lessons change only when a cycle finishes, so they reload on completion rather than
+// joining the 2.5s trading-status poll.
+function TeamLessons({ teamId, request, refreshKey }: { teamId: string; request: Request; refreshKey: string | null }) {
+  const [lessons, setLessons] = useState<TeamLesson[] | null>(null);
+  const [showRetired, setShowRetired] = useState(false);
+  const [busyId, setBusyId] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const path = `/finance-teams/${encodeURIComponent(teamId)}/lessons`;
+  useEffect(() => {
+    let cancelled = false;
+    request<TeamLesson[]>(path)
+      .then((result) => { if (!cancelled) { setLessons(result); setError(null); } })
+      .catch((reason) => { if (!cancelled) setError(reason instanceof Error ? reason.message : String(reason)); });
+    return () => { cancelled = true; };
+  }, [path, request, refreshKey]);
+
+  async function retire(lesson: TeamLesson) {
+    setBusyId(lesson.id);
+    try {
+      const updated = await request<TeamLesson>(`${path}/${encodeURIComponent(lesson.id)}/retire`, { method: "POST" });
+      setLessons((current) => current?.map((entry) => entry.id === updated.id ? updated : entry) ?? null);
+      setError(null);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  const active = lessons?.filter((lesson) => !lesson.retiredAt) ?? [];
+  const retired = lessons?.filter((lesson) => lesson.retiredAt) ?? [];
+  const shown = showRetired ? [...active, ...retired] : active;
+  return <div className="team-lessons">
+    <div className="team-lessons-heading">
+      <span className="eyebrow"><Brain size={12} /> LESSONS FROM GRADED DECISIONS</span>
+      {retired.length > 0 && <button className="text-button" onClick={() => setShowRetired(!showRetired)}>{showRetired ? "Hide" : "Show"} {retired.length} retired</button>}
+    </div>
+    {error && <p className="team-trading-error">{error}</p>}
+    {lessons === null && !error && <small className="team-lessons-empty">Loading lessons…</small>}
+    {lessons !== null && shown.length === 0 && <small className="team-lessons-empty">No lessons yet. A lesson appears when a graded trade decision turns out wrong and the lead names a repeatable error.</small>}
+    {shown.map((lesson) => <article key={lesson.id} className={`team-lesson${lesson.retiredAt ? " retired" : ""}`}>
+      <header>
+        <strong>When {lesson.trigger}</strong>
+        <div className="team-lesson-meta">
+          <span className={`lesson-verdict verdict-${lesson.retiredAt ? "retired" : lesson.score.verdict.toLowerCase()}`}>{lesson.retiredAt ? "Retired" : LESSON_VERDICT[lesson.score.verdict]}</span>
+          {!lesson.retiredAt && <button className="icon-button" title="Retire lesson" disabled={busyId === lesson.id} onClick={() => void retire(lesson)}>{busyId === lesson.id ? <LoaderCircle size={13} className="spin" /> : <Trash2 size={13} />}</button>}
+        </div>
+      </header>
+      <dl>
+        <div><dt>Better approach</dt><dd>{lesson.betterApproach}</dd></div>
+        <div><dt>Avoid</dt><dd>{lesson.avoid}</dd></div>
+        <div><dt>Verify</dt><dd>{lesson.verify}</dd></div>
+      </dl>
+      <footer>
+        <span>{lesson.score.trials ? `Right on ${lesson.score.correct} of ${lesson.score.trials} decisions it was shown on, versus ${Math.round(lesson.score.baselineRate * 100)}% without it` : "Not yet shown on a graded decision"}</span>
+        <span>{lesson.retiredAt ? lesson.retiredReason : lesson.memorySynced ? "In shared memory" : "Shared memory sync pending"} · {relative(lesson.createdAt)}</span>
+      </footer>
+    </article>)}
+  </div>;
 }
 
 function TeamRoster({ members }: { members: FinanceTeamMember[] }) {

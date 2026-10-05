@@ -58,6 +58,8 @@ export function createFinanceRouter({ service, teamTrading, actorForRequest = ()
     router.get("/finance-teams/trading", route(() => teamTrading.list()));
     router.post("/finance-teams/:teamId/trading/start", route((req) => teamTrading.start(req.params.teamId)));
     router.post("/finance-teams/:teamId/trading/stop", route((req) => teamTrading.stop(req.params.teamId)));
+    router.get("/finance-teams/:teamId/lessons", route((req) => teamTrading.lessons(req.params.teamId)));
+    router.post("/finance-teams/:teamId/lessons/:lessonId/retire", route((req) => teamTrading.retireLesson(req.params.teamId, req.params.lessonId)));
   }
   router.get("/finance-teams/portfolios", route((_req, actor) => service.listTeamPortfolios(actor)));
   router.get("/finance-teams/context", route((req, actor) => service.getFinanceTeamContext(actor, req.query.agentId)));

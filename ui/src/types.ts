@@ -215,6 +215,29 @@ export type TeamTradingRun = {
   completedAt: string | null;
 };
 
+export type TeamLesson = {
+  id: string;
+  portfolioId: string;
+  proposalId: string;
+  authorAgentId: string;
+  trigger: string;
+  betterApproach: string;
+  avoid: string;
+  verify: string;
+  createdAt: string;
+  retiredAt: string | null;
+  retiredReason: string | null;
+  memorySynced: boolean;
+  score: {
+    trials: number;
+    correct: number;
+    correctRate: number | null;
+    baselineTrials: number;
+    baselineRate: number;
+    verdict: "LEARNING" | "HELPING" | "NOT_HELPING";
+  };
+};
+
 export type Strategy = {
   id: string;
   name: string;

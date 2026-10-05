@@ -27,7 +27,7 @@ flowchart LR
 | --- | --- | --- |
 | ORION/OpenClaw | Agents, sessions, models, memory, orchestration, tool allowlists | Financial state or risk policy |
 | Generic ORION plugin runtime | Package discovery, package-root isolation, authenticated mount points, UI registration, lifecycle | Finance-specific logic |
-| Finance Lab | Market adapters, strategies, finance permissions, risk, local paper execution, read-only IBKR paper state, evidence, evaluation, experiments | Agent records, prompts, memory, or live-account routing |
+| Finance Lab | Market adapters, strategies, finance permissions, risk, local paper execution, read-only IBKR paper state, evidence, evaluation, experiments, team lessons graded from its own outcomes | Agent records, prompts, memory, or live-account routing |
 | Market provider | External market retrieval | Portfolio or strategy policy |
 | TradingAgents checkout | Its multi-agent research graph and provider configuration | Finance Lab persistence, execution, or risk decisions |
 
@@ -79,6 +79,22 @@ Every research, planning, and proposal handoff includes the team's current paper
 Research considers up to three candidates within supported capabilities: cash-funded buys of permitted equities/ETFs and sells of held positions. A sell cannot open a short; options and atomic paired orders are unsupported. Team disposition guides analysis. Neutral disposition means choosing without a fixed directional bias; an explicit portfolio mandate still governs. Ordinary uncertainty can justify a smaller paper position, while insufficient evidence or a hard risk limit can justify no trade.
 
 No-trade and explicit rejection reasons remain visible in the cycle status. Completed, stopped, and failed cycles also write their outcome to the existing SQLite `audit_log` under `finance.team.trading.complete`. A missing or malformed lead decision fails the cycle and leaves its proposal unresolved; it never becomes implicit approval or a fabricated investment rejection. The cycle status remains process-local, while the audit survives restarts.
+
+### Learning from graded decisions
+
+Each cycle's proposal carries a forecast from the trader: horizon, confidence, expected return range, and invalidation. The coordinator records it as an ordinary prediction owned by the trader and links it to the proposal through `trade_proposals.prediction_id`. The record is made before lead review, so rejected drafts are graded too. The existing hourly prediction evaluator scores it. A proposal with a missing or invalid forecast still trades, but it is never graded.
+
+Before research, each cycle reviews up to three graded, decided proposals that have not been reviewed yet:
+
+- A correct decision is marked reviewed without a model call.
+- A mistake gets a lead post-mortem turn. A mistake is a taken trade that moved against its forecast, or a declined trade whose forecast came true. The lead returns either a `Trigger / Better approach / Avoid / Verify` lesson or `NONE` when the outcome looks like noise or a hard risk limit decided it.
+- A failed turn leaves the decision for a later cycle. A malformed reply is final, so one bad decision cannot stall the queue.
+
+Lessons live in `team_lessons` in the Finance SQLite database, one per proposal at most. The five most recent active lessons are passed to the research, strategy, proposal, and lead-review handoffs. They never override current evidence or the deterministic risk engine.
+
+Each proposal records which lessons its cycle was shown (`proposal_lessons`). Lessons are scored by exposure: once a lesson has been shown on six graded decisions, its correct rate is compared with the team's decisions made without it. With no such decisions, it is compared with a coin flip. A lesson that does not beat that baseline is retired with its numbers as the reason. All active lessons are shown together, so this is attribution by exposure rather than a controlled trial. The operator can also retire a lesson from the team's portfolio card.
+
+When ORION provides plugin memory, active lessons are mirrored into the shared second brain as `shared_lesson` notes, keyed per lesson and tagged with the plugin ID. Retired lessons are removed. Finance SQLite stays the source of truth: if the vault is unavailable, sync is retried on the next cycle.
 
 ## Decision and execution flow
 

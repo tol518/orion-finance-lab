@@ -1488,6 +1488,124 @@ textarea:focus {
   overflow-wrap: anywhere;
 }
 
+.team-lessons {
+  display: grid;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.team-lessons-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.team-lessons-heading .eyebrow {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.team-lessons-empty {
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.45;
+}
+
+.team-lesson {
+  display: grid;
+  gap: 8px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 10px;
+}
+
+.team-lesson.retired {
+  opacity: 0.6;
+}
+
+.team-lesson header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.team-lesson header strong {
+  color: var(--text-strong);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.team-lesson-meta {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 6px;
+}
+
+.lesson-verdict {
+  border-radius: 4px;
+  padding: 2px 6px;
+  background: color-mix(in srgb, var(--muted) 14%, transparent);
+  color: var(--muted);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.lesson-verdict.verdict-helping {
+  background: color-mix(in srgb, var(--green) 14%, transparent);
+  color: var(--green);
+}
+
+.lesson-verdict.verdict-not_helping {
+  background: color-mix(in srgb, var(--amber) 14%, transparent);
+  color: var(--amber);
+}
+
+.team-lesson dl {
+  display: grid;
+  gap: 4px;
+  margin: 0;
+}
+
+.team-lesson dl div {
+  display: grid;
+  grid-template-columns: 110px minmax(0, 1fr);
+  gap: 8px;
+}
+
+.team-lesson dt {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.team-lesson dd {
+  margin: 0;
+  color: var(--text);
+  font-size: 10px;
+  line-height: 1.45;
+}
+
+.team-lesson footer {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 4px 12px;
+  color: var(--muted);
+  font-size: 9px;
+}
+
+@media (max-width: 640px) {
+  .team-lesson dl div {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 2px;
+  }
+}
+
 .team-member {
   display: inline-flex;
   align-items: center;

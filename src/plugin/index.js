@@ -36,6 +36,7 @@ const plugin = {
     teamTrading = new TeamTradingCoordinator({
       service: financeLab,
       agentRuntime: context.agentRuntime,
+      memory: context.memory,
       logger: context.logger,
     });
     const serviceToken = process.env.FINANCE_SERVICE_TOKEN;

@@ -281,6 +281,32 @@ export class FinanceStore {
         created_at TEXT NOT NULL
       );
 
+      -- Lessons are distilled from a graded proposal (its linked prediction), so each one
+      -- names the outcome it came from and stays auditable after the team is removed.
+      CREATE TABLE IF NOT EXISTS team_lessons (
+        id TEXT PRIMARY KEY,
+        portfolio_id TEXT NOT NULL REFERENCES portfolios(id),
+        proposal_id TEXT NOT NULL UNIQUE REFERENCES trade_proposals(id),
+        author_agent_id TEXT NOT NULL,
+        trigger_text TEXT NOT NULL,
+        better_approach TEXT NOT NULL,
+        avoid TEXT NOT NULL,
+        verify TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        retired_at TEXT,
+        retired_reason TEXT,
+        memory_synced_at TEXT
+      );
+
+      -- Which lessons each proposal's cycle was shown; scoring compares decisions made
+      -- with a lesson against the team's decisions made without it.
+      CREATE TABLE IF NOT EXISTS proposal_lessons (
+        proposal_id TEXT NOT NULL REFERENCES trade_proposals(id),
+        lesson_id TEXT NOT NULL REFERENCES team_lessons(id),
+        PRIMARY KEY (proposal_id, lesson_id)
+      );
+
+      CREATE INDEX IF NOT EXISTS team_lessons_portfolio_time ON team_lessons(portfolio_id, created_at DESC);
       CREATE INDEX IF NOT EXISTS trades_portfolio_time ON trades(portfolio_id, executed_at DESC);
       CREATE INDEX IF NOT EXISTS predictions_agent_time ON predictions(agent_id, created_at DESC);
       CREATE INDEX IF NOT EXISTS predictions_due ON predictions(due_at);
@@ -318,6 +344,12 @@ export class FinanceStore {
     }
     if (!proposalColumns.has("lead_approved_at")) {
       this.db.exec("ALTER TABLE trade_proposals ADD COLUMN lead_approved_at TEXT");
+    }
+    if (!proposalColumns.has("prediction_id")) {
+      this.db.exec("ALTER TABLE trade_proposals ADD COLUMN prediction_id TEXT REFERENCES predictions(id)");
+    }
+    if (!proposalColumns.has("reflected_at")) {
+      this.db.exec("ALTER TABLE trade_proposals ADD COLUMN reflected_at TEXT");
     }
     // Rows written before the column existed carry rank 0; assignment order becomes the
     // hierarchy, so the first agent added to each team becomes its lead.
@@ -531,6 +563,99 @@ export class FinanceStore {
       });
     }
     return this.getProposal(proposalId);
+  }
+
+  linkProposalPrediction(proposalId, predictionId) {
+    this.db.prepare("UPDATE trade_proposals SET prediction_id = ? WHERE id = ?").run(predictionId, proposalId);
+    return this.getProposal(proposalId);
+  }
+
+  // A proposal is gradeable once its forecast has a result and the lead has decided it;
+  // PROPOSED drafts are still undecided, so there is no decision to learn from yet.
+  listUnreflectedGradedProposals(portfolioId, { limit = 3 } = {}) {
+    return this.db.prepare(`
+      SELECT tp.* FROM trade_proposals tp
+      JOIN prediction_results r ON r.prediction_id = tp.prediction_id
+      WHERE tp.portfolio_id = ? AND tp.reflected_at IS NULL AND tp.status <> 'PROPOSED'
+      ORDER BY r.evaluated_at LIMIT ?
+    `).all(portfolioId, limit).map((row) => ({
+      ...mapProposal(row),
+      prediction: this.getPrediction(row.prediction_id),
+    }));
+  }
+
+  // Marking the proposal reflected and saving its lesson commit together, so a crash can
+  // neither drop a lesson nor make the same outcome produce a second one.
+  recordProposalReflection({ proposalId, authorAgentId, lesson = null }) {
+    const now = new Date().toISOString();
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const proposal = this.db.prepare("SELECT portfolio_id FROM trade_proposals WHERE id = ? AND reflected_at IS NULL").get(proposalId);
+      if (proposal && lesson) {
+        this.db.prepare(`
+          INSERT INTO team_lessons (
+            id, portfolio_id, proposal_id, author_agent_id, trigger_text, better_approach, avoid, verify, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(randomUUID(), proposal.portfolio_id, proposalId, authorAgentId, lesson.trigger, lesson.betterApproach, lesson.avoid, lesson.verify, now);
+      }
+      this.db.prepare("UPDATE trade_proposals SET reflected_at = ? WHERE id = ? AND reflected_at IS NULL").run(now, proposalId);
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  listTeamLessons(portfolioId, { limit = 5, includeRetired = false } = {}) {
+    return this.db.prepare(`
+      SELECT * FROM team_lessons WHERE portfolio_id = ? ${includeRetired ? "" : "AND retired_at IS NULL"}
+      ORDER BY created_at DESC LIMIT ?
+    `).all(portfolioId, limit).map(mapLesson);
+  }
+
+  getTeamLesson(id) {
+    const row = this.db.prepare("SELECT * FROM team_lessons WHERE id = ?").get(id);
+    return row ? mapLesson(row) : null;
+  }
+
+  recordProposalLessons(proposalId, lessonIds) {
+    const insert = this.db.prepare("INSERT OR IGNORE INTO proposal_lessons (proposal_id, lesson_id) VALUES (?, ?)");
+    for (const lessonId of lessonIds) insert.run(proposalId, lessonId);
+  }
+
+  // A decision is correct when a taken trade moved with its forecast, or a declined one
+  // moved against it — the same rule reflection uses to pick mistakes.
+  listGradedDecisions(portfolioId) {
+    const rows = this.db.prepare(`
+      SELECT tp.id, CASE WHEN tp.status = 'REJECTED' THEN 1 - r.direction_correct ELSE r.direction_correct END AS correct,
+             (SELECT group_concat(pl.lesson_id) FROM proposal_lessons pl WHERE pl.proposal_id = tp.id) AS lesson_ids
+      FROM trade_proposals tp JOIN prediction_results r ON r.prediction_id = tp.prediction_id
+      WHERE tp.portfolio_id = ? AND tp.status <> 'PROPOSED'
+    `).all(portfolioId);
+    return rows.map((row) => ({
+      proposalId: row.id,
+      correct: row.correct === 1,
+      lessonIds: row.lesson_ids ? row.lesson_ids.split(",") : [],
+    }));
+  }
+
+  retireTeamLesson(id, reason) {
+    this.db.prepare("UPDATE team_lessons SET retired_at = ?, retired_reason = ? WHERE id = ? AND retired_at IS NULL")
+      .run(new Date().toISOString(), reason, id);
+    return this.getTeamLesson(id);
+  }
+
+  // Active lessons not yet in shared memory, and retired ones still there.
+  listLessonsNeedingMemorySync(portfolioId) {
+    return this.db.prepare(`
+      SELECT * FROM team_lessons WHERE portfolio_id = ?
+        AND ((retired_at IS NULL AND memory_synced_at IS NULL) OR (retired_at IS NOT NULL AND memory_synced_at IS NOT NULL))
+      ORDER BY created_at
+    `).all(portfolioId).map(mapLesson);
+  }
+
+  setLessonMemorySynced(id, synced) {
+    this.db.prepare("UPDATE team_lessons SET memory_synced_at = ? WHERE id = ?").run(synced ? new Date().toISOString() : null, id);
   }
 
   claimProposalForBroker({ proposalId, leadAgentId, traderAgentId, decision }) {
@@ -1508,8 +1633,26 @@ function mapProposal(row) {
     approvedQuantity: row.approved_quantity === null ? null : Number(row.approved_quantity),
     leadApprovedByAgentId: row.lead_approved_by_agent_id ?? null,
     leadApprovedAt: row.lead_approved_at ?? null,
+    predictionId: row.prediction_id ?? null,
     createdAt: row.created_at,
     resolvedAt: row.resolved_at,
+  };
+}
+
+function mapLesson(row) {
+  return {
+    id: row.id,
+    portfolioId: row.portfolio_id,
+    proposalId: row.proposal_id,
+    authorAgentId: row.author_agent_id,
+    trigger: row.trigger_text,
+    betterApproach: row.better_approach,
+    avoid: row.avoid,
+    verify: row.verify,
+    createdAt: row.created_at,
+    retiredAt: row.retired_at ?? null,
+    retiredReason: row.retired_reason ?? null,
+    memorySynced: Boolean(row.memory_synced_at),
   };
 }
 

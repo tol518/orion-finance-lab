@@ -61,6 +61,8 @@ Non-operator calls are forced to the trusted caller's own predictions, proposals
 | `GET /finance-teams` | Operator/dashboard | List up to five Finance teams and their assigned members. |
 | `POST /finance-teams` | Operator/dashboard | Create a team with one to five assigned ORION agents. |
 | `DELETE /finance-teams/:teamId` | Operator/dashboard | Delete a Finance team and release its member assignments. |
+| `GET /finance-teams/:teamId/lessons` | Operator/dashboard | The team's lessons from graded decisions, including retired ones, with exposure scores. |
+| `POST /finance-teams/:teamId/lessons/:lessonId/retire` | Operator/dashboard | Retire a lesson so later cycles stop receiving it, and remove it from shared memory. |
 | `GET /experiments` | `portfolio.read` | Experiment definitions and isolated portfolio IDs. |
 | `POST /experiments` | `experiment.manage` | Create experiment with fixed starting assumptions. |
 | `GET /evidence/:id` | `audit.read` | Immutable evidence manifest. |
