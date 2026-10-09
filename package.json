@@ -21,7 +21,7 @@
   "dependencies": {
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
-    "yahoo-finance2": "^4.0.2"
+    "yahoo-finance2": "^4.0.3"
   },
   "peerDependencies": {
     "@orion-os/plugin-sdk": ">=0.1.0"
